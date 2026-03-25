@@ -16,34 +16,46 @@ export type AuthLike = {
 // ---------------------------------------------------------------------------
 
 /**
- * Base configuration shared across all applications.
- * `authority` is the primary field (supports sovereign clouds).
- * `tenantId` is optional convenience — if provided and `authority` is omitted
- * at the application level, `authority` defaults to
- * `https://login.microsoftonline.com/<tenantId>`.
+ * Configuration for the middle-tier application that performs the OBO exchange.
+ *
+ * These fields are fixed for your entire deployment:
+ * - `clientId` / `clientSecret` identify *your* app registration in Entra ID.
+ *   The OBO `assertion` token's `aud` claim must match `clientId` — they
+ *   cannot differ between downstream applications.
+ * - `authority` is the token endpoint for the user's tenant. In the OBO
+ *   protocol the tenant is determined by the `tid` claim in the incoming
+ *   assertion, not by which downstream API you are calling. Using `/common`
+ *   or `/organizations` is explicitly discouraged by Microsoft (especially
+ *   for guest users).
+ * - `tenantId` is an optional convenience: if `authority` is omitted it is
+ *   derived as `https://login.microsoftonline.com/<tenantId>`.
  */
-type BaseApplicationConfig = {
-  /** Social provider — only "microsoft" is supported for OBO today. */
-  socialProvider: "microsoft";
+type OboDefaultConfig = {
   /**
    * Token endpoint authority, e.g. `https://login.microsoftonline.com/my-tenant`.
-   * Required at the resolved config level (either here or in defaultConfig).
+   * Required unless `tenantId` is provided.
    */
-  authority: string;
+  authority?: string;
+  /**
+   * Convenience alternative to `authority`. Used to derive
+   * `https://login.microsoftonline.com/<tenantId>` when `authority` is absent.
+   */
+  tenantId?: string;
   /** Azure AD Application (client) ID of the *middle-tier* app. */
   clientId: string;
   /** Azure AD client secret of the *middle-tier* app. */
   clientSecret: string;
-  /** Optional — used only to derive `authority` when `authority` is absent. */
-  tenantId?: string;
 };
 
 /**
- * Per-application override config.
- * Any field from `BaseApplicationConfig` can be overridden here; only `scopes`
- * is required because it is always application-specific.
+ * Per-downstream-application config.
+ *
+ * The only thing that varies between downstream applications is the set of
+ * scopes you want the OBO token to carry. Everything else (`clientId`,
+ * `clientSecret`, `authority`) belongs to your middle-tier app and is
+ * configured once in `defaultConfig`.
  */
-type ApplicationConfig = Partial<BaseApplicationConfig> & {
+type ApplicationConfig = {
   /** An optional stable identifier for this application entry. */
   id?: string;
   /**
@@ -60,10 +72,10 @@ type ApplicationsConfig = {
 /** Options passed to `oboPlugin()`. */
 type OboPluginOptions = {
   /**
-   * Defaults applied to every application unless overridden at the
-   * application level.
+   * Middle-tier application credentials and token endpoint.
+   * Shared across all downstream application exchanges.
    */
-  defaultConfig: BaseApplicationConfig;
+  defaultConfig: OboDefaultConfig;
   /**
    * Named downstream applications to exchange tokens for.
    * Keys are the `applicationName` strings passed to `exchangeOboToken`.
@@ -91,21 +103,22 @@ type MicrosoftOBOError = {
   correlation_id?: string;
 };
 
-/** Resolved config — all required fields guaranteed to be present. */
-type ResolvedApplicationConfig = BaseApplicationConfig & ApplicationConfig;
+/** Fully resolved config — `authority`, `clientId`, `clientSecret` and `scopes` guaranteed present. */
+type ResolvedConfig = Omit<OboDefaultConfig, "authority"> & Required<Pick<OboDefaultConfig, "authority" | "clientId" | "clientSecret">> & ApplicationConfig;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /**
- * Merge `defaultConfig` with a per-application override, returning a fully
- * resolved config. Throws if any required field is missing after merging.
+ * Validate `defaultConfig` and merge it with a per-application entry,
+ * returning a fully resolved config. Throws with a clear message on any
+ * missing required field.
  */
 function resolveConfig(
   options: OboPluginOptions,
   applicationName: string,
-): ResolvedApplicationConfig {
+): ResolvedConfig {
   const appConfig = options.applications[applicationName];
   if (!appConfig) {
     throw new Error(
@@ -114,27 +127,30 @@ function resolveConfig(
     );
   }
 
-  const merged = { ...options.defaultConfig, ...appConfig } as ResolvedApplicationConfig;
-
-  // Derive authority from tenantId if authority is missing
-  if (!merged.authority && merged.tenantId) {
-    merged.authority = `https://login.microsoftonline.com/${merged.tenantId}`;
-  }
+  // Derive authority from tenantId if authority is absent
+  const authority =
+    options.defaultConfig.authority ??
+    (options.defaultConfig.tenantId
+      ? `https://login.microsoftonline.com/${options.defaultConfig.tenantId}`
+      : undefined);
 
   const missing: string[] = [];
-  if (!merged.authority) missing.push("authority");
-  if (!merged.clientId) missing.push("clientId");
-  if (!merged.clientSecret) missing.push("clientSecret");
-  if (!merged.socialProvider) missing.push("socialProvider");
-  if (!merged.scopes?.length) missing.push("scopes");
+  if (!authority) missing.push("authority (or tenantId)");
+  if (!options.defaultConfig.clientId) missing.push("clientId");
+  if (!options.defaultConfig.clientSecret) missing.push("clientSecret");
+  if (!appConfig.scopes?.length) missing.push(`applications.${applicationName}.scopes`);
 
   if (missing.length > 0) {
     throw new Error(
-      `[obo-plugin] Missing required config fields for application "${applicationName}": ${missing.join(", ")}`,
+      `[obo-plugin] Missing required config for application "${applicationName}": ${missing.join(", ")}`,
     );
   }
 
-  return merged;
+  return {
+    ...options.defaultConfig,
+    ...appConfig,
+    authority: authority!,
+  };
 }
 
 /**
@@ -148,41 +164,30 @@ function oboProviderId(applicationName: string): string {
 /**
  * Perform the Microsoft OBO token exchange HTTP call.
  *
- * @param config   Fully resolved application config.
+ * @param config    Fully resolved config.
  * @param assertion The user's current Microsoft access token (the "incoming" token).
- * @param fetchOptions Optional `better-fetch` options (e.g. custom agent for tests).
+ * @param fetchOptions Optional `better-fetch` options (e.g. custom fetch impl for tests).
  */
 function fetchOboToken(
-  config: ResolvedApplicationConfig,
+  config: ResolvedConfig,
   assertion: string,
   fetchOptions?: BetterFetchOption,
 ): ReturnType<typeof betterFetch<MicrosoftOBOToken>> {
-  switch (config.socialProvider) {
-    case "microsoft": {
-      const url = `${config.authority}/oauth2/v2.0/token`;
-      const body = new URLSearchParams({
-        client_id: config.clientId,
-        client_secret: config.clientSecret,
-        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-        assertion,
-        requested_token_use: "on_behalf_of",
-        scope: config.scopes.join(" "),
-      });
-      const headers = { "Content-Type": "application/x-www-form-urlencoded" };
-      return betterFetch<MicrosoftOBOToken>(url, {
-        ...fetchOptions,
-        body,
-        headers,
-        method: "POST",
-      });
-    }
-    default: {
-      // TypeScript narrows this to `never` since `socialProvider` is a union
-      // of a single literal — kept for future extensibility.
-      const _exhaustive: never = config.socialProvider;
-      throw new Error(`[obo-plugin] Unsupported social provider: ${String(_exhaustive)}`);
-    }
-  }
+  const url = `${config.authority}/oauth2/v2.0/token`;
+  const body = new URLSearchParams({
+    client_id: config.clientId,
+    client_secret: config.clientSecret,
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion,
+    requested_token_use: "on_behalf_of",
+    scope: config.scopes.join(" "),
+  });
+  return betterFetch<MicrosoftOBOToken>(url, {
+    ...fetchOptions,
+    body,
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    method: "POST",
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +208,7 @@ async function _exchangeOboToken(
   fetchOptions?: BetterFetchOption,
 ): Promise<{ data: MicrosoftOBOToken | null; error: string | null }> {
   // 1. Resolve and validate config
-  let config: ResolvedApplicationConfig;
+  let config: ResolvedConfig;
   try {
     config = resolveConfig(pluginOptions, applicationName);
   } catch (err) {
@@ -323,7 +328,6 @@ async function _exchangeOboToken(
  *   plugins: [
  *     oboPlugin({
  *       defaultConfig: {
- *         socialProvider: "microsoft",
  *         authority: "https://login.microsoftonline.com/my-tenant-id",
  *         clientId: process.env.AZURE_CLIENT_ID!,
  *         clientSecret: process.env.AZURE_CLIENT_SECRET!,

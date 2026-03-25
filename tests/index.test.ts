@@ -12,18 +12,13 @@ import {
 
 const PLUGIN_OPTIONS: OboPluginOptions = {
   defaultConfig: {
-    socialProvider: "microsoft",
     authority: "https://login.microsoftonline.com/test-tenant",
     clientId: "test-client-id",
     clientSecret: "test-client-secret",
   },
   applications: {
     graph: { scopes: ["https://graph.microsoft.com/.default"] },
-    "my-api": {
-      scopes: ["api://my-api/.default"],
-      // override clientId for this app
-      clientId: "my-api-client-id",
-    },
+    "my-api": { scopes: ["api://my-api/.default"] },
   },
 };
 
@@ -82,12 +77,23 @@ describe("exchangeOboToken — config resolution", () => {
     expect(error).toContain("nonexistent-app");
   });
 
-  it("merges application config over defaultConfig", async () => {
-    // Verify by inspecting the fetch call — the overridden clientId should appear.
-    const { auth, signInWithTestUser } = await buildAuth();
+  it("derives the authority from tenantId when authority is omitted", async () => {
+    const optionsWithTenantId: OboPluginOptions = {
+      defaultConfig: {
+        tenantId: "my-tenant-id",
+        clientId: "test-client-id",
+        clientSecret: "test-client-secret",
+      },
+      applications: {
+        graph: { scopes: ["https://graph.microsoft.com/.default"] },
+      },
+    };
+
+    const { auth, signInWithTestUser } = await getTestInstance({
+      plugins: [oboPlugin(optionsWithTenantId)],
+    });
     const { user } = await signInWithTestUser();
 
-    // Seed a Microsoft account for the test user
     const ctx = await auth.$context;
     await ctx.internalAdapter.createAccount({
       userId: user.id,
@@ -97,21 +103,82 @@ describe("exchangeOboToken — config resolution", () => {
       accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
     });
 
-    let capturedBody: URLSearchParams | undefined;
-    const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      capturedBody = init?.body as URLSearchParams;
+    let capturedUrl: string | undefined;
+    const mockFetch = vi.fn(async (url: string | URL | Request) => {
+      capturedUrl = url.toString();
       return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
     });
 
+    await exchangeOboToken(auth, optionsWithTenantId, user.id, "graph", {
+      customFetchImpl: mockFetch as never,
+    });
+
+    expect(capturedUrl).toBe(
+      "https://login.microsoftonline.com/my-tenant-id/oauth2/v2.0/token",
+    );
+  });
+
+  it("returns an error when neither authority nor tenantId is provided", async () => {
+    const badOptions: OboPluginOptions = {
+      defaultConfig: {
+        clientId: "test-client-id",
+        clientSecret: "test-client-secret",
+      },
+      applications: {
+        graph: { scopes: ["https://graph.microsoft.com/.default"] },
+      },
+    };
+    const { auth } = await buildAuth();
+    const { data, error } = await exchangeOboToken(auth, badOptions, "any-user", "graph");
+    expect(data).toBeNull();
+    expect(error).toContain("authority");
+  });
+
+  it("uses defaultConfig clientId for all applications and varies only scope", async () => {
+    const { auth, signInWithTestUser } = await buildAuth();
+    const { user } = await signInWithTestUser();
+
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.createAccount({
+      userId: user.id,
+      providerId: "microsoft",
+      accountId: "ms-account-id",
+      accessToken: "ms-access-token",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    const bodies: URLSearchParams[] = [];
+    const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init?.body as URLSearchParams);
+      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    // Call for two different downstream applications
+    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "graph", {
+      customFetchImpl: mockFetch as never,
+    });
+    // Expire the cache so the second app also makes an HTTP call
+    const cachedGraph = await ctx.internalAdapter.findAccountByProviderId(user.id, "obo-graph");
+    await ctx.internalAdapter.updateAccount(cachedGraph!.id, {
+      accessTokenExpiresAt: new Date(Date.now() - 1_000),
+    });
     await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "my-api", {
       customFetchImpl: mockFetch as never,
     });
 
-    expect(capturedBody?.get("client_id")).toBe("my-api-client-id");
-    expect(capturedBody?.get("scope")).toBe("api://my-api/.default");
+    // clientId must be the same (defaultConfig) for both calls
+    expect(bodies[0]?.get("client_id")).toBe("test-client-id");
+    expect(bodies[1]?.get("client_id")).toBe("test-client-id");
+
+    // scope is the only thing that differs
+    expect(bodies[0]?.get("scope")).toBe("https://graph.microsoft.com/.default");
+    expect(bodies[1]?.get("scope")).toBe("api://my-api/.default");
   });
 });
 
