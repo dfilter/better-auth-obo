@@ -1,17 +1,17 @@
 {
-  "name": "tsdown-starter",
+  "name": "better-auth-obo",
   "type": "module",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "A starter for creating a TypeScript package.",
-  "author": "Author Name <author.name@mail.com>",
+  "author": "Dirk Filter <dirk_filter@outlook.com>",
   "license": "MIT",
-  "homepage": "https://github.com/author/library#readme",
+  "homepage": "https://github.com/dfilter/better-auth-obo#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/author/library.git"
+    "url": "git+https://github.com/dfilter/better-auth-obo.git"
   },
   "bugs": {
-    "url": "https://github.com/author/library/issues"
+    "url": "https://github.com/dfilter/better-auth-obo/issues"
   },
   "exports": {
     ".": "./dist/index.mjs",
