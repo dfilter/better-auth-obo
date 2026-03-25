@@ -40,16 +40,18 @@
     "release": "bumpp",
     "prepublishOnly": "pnpm run build"
   },
+  "peerDependencies": {
+    "@better-fetch/fetch": "^1.1.0",
+    "better-auth": "^1.0.0"
+  },
   "devDependencies": {
+    "@better-fetch/fetch": "^1.1.21",
     "@types/node": "^25.5.0",
     "@typescript/native-preview": "7.0.0-dev.20260316.1",
+    "better-auth": "^1.5.6",
     "bumpp": "^11.0.1",
     "tsdown": "^0.21.3",
     "typescript": "^5.9.3",
     "vitest": "^4.1.0"
-  },
-  "dependencies": {
-    "@better-fetch/fetch": "^1.1.21",
-    "better-auth": "^1.5.6"
   }
 }

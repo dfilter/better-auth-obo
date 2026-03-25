@@ -24,6 +24,8 @@ npm install better-auth-obo
 pnpm add better-auth-obo
 ```
 
+`better-auth` and `@better-fetch/fetch` are peer dependencies — they must be present in your project. `better-auth` almost certainly already is, and `@better-fetch/fetch` is included transitively by `better-auth` itself.
+
 ---
 
 ## Setup
