@@ -20,6 +20,17 @@
   "files": [
     "dist"
   ],
+  "keywords": [
+    "better-auth",
+    "On Behalf Of",
+    "OBO",
+    "Entra ID",
+    "Microsoft Entra ID",
+    "Microsoft",
+    "better-fetch",
+    "token exchange",
+    "OAuth2.0"
+  ],
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
