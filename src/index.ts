@@ -186,75 +186,17 @@ function fetchOboToken(
 }
 
 // ---------------------------------------------------------------------------
-// Plugin
+// Core implementation (private)
 // ---------------------------------------------------------------------------
 
 /**
- * Better Auth server-side plugin for Microsoft On-Behalf-Of (OBO) token exchange.
- *
- * This plugin does not add any HTTP endpoints or a client plugin. All OBO
- * functionality is exposed via the exported `exchangeOboToken` helper.
- *
- * @example
- * ```ts
- * import { betterAuth } from "better-auth";
- * import { oboPlugin, exchangeOboToken } from "better-auth-obo";
- *
- * export const auth = betterAuth({
- *   plugins: [
- *     oboPlugin({
- *       defaultConfig: {
- *         socialProvider: "microsoft",
- *         authority: "https://login.microsoftonline.com/my-tenant-id",
- *         clientId: process.env.AZURE_CLIENT_ID!,
- *         clientSecret: process.env.AZURE_CLIENT_SECRET!,
- *       },
- *       applications: {
- *         "graph": { scopes: ["https://graph.microsoft.com/.default"] },
- *         "my-api": { scopes: ["api://my-api/.default"] },
- *       },
- *     }),
- *   ],
- * });
- *
- * // Later, on your server:
- * const { data, error } = await exchangeOboToken(auth, userId, "graph");
- * if (data) {
- *   // use data.access_token to call Microsoft Graph on behalf of the user
- * }
- * ```
+ * Internal implementation of the OBO token exchange.
+ * Accepts `InternalAdapter` directly so it can be called both from the public
+ * standalone helper (which awaits `auth.$context`) and from the plugin's `init`
+ * hook (which already holds the live `AuthContext`).
  */
-export const oboPlugin = (options: OboPluginOptions) => {
-  return {
-    id: "obo-plugin",
-    options,
-  } satisfies BetterAuthPlugin;
-};
-
-// ---------------------------------------------------------------------------
-// Standalone helper
-// ---------------------------------------------------------------------------
-
-/**
- * Exchange the authenticated user's stored Microsoft access token for an OBO
- * (On-Behalf-Of) token scoped to a downstream application.
- *
- * OBO tokens are **cached** in Better Auth's `account` table under a synthetic
- * `providerId` of `"obo-<applicationName>"`. A cached token is reused as long
- * as it expires more than 60 seconds in the future. Once expired, a fresh OBO
- * exchange is made automatically using the user's stored Microsoft access token.
- *
- * @param auth            The Better Auth instance (from `betterAuth(...)`).
- * @param pluginOptions   The same options object passed to `oboPlugin()`.
- * @param userId          The Better Auth user ID to exchange on behalf of.
- * @param applicationName A key from `pluginOptions.applications`.
- * @param fetchOptions    Optional `@better-fetch/fetch` options (e.g. for testing).
- *
- * @returns `{ data: MicrosoftOBOToken, error: null }` on success,
- *          `{ data: null, error: string }` on failure.
- */
-export async function exchangeOboToken(
-  auth: AuthLike,
+async function _exchangeOboToken(
+  adapter: InternalAdapter,
   pluginOptions: OboPluginOptions,
   userId: string,
   applicationName: string,
@@ -268,8 +210,6 @@ export async function exchangeOboToken(
     return { data: null, error: (err as Error).message };
   }
 
-  const ctx = await auth.$context;
-  const adapter = ctx.internalAdapter;
   const providerId = oboProviderId(applicationName);
 
   // 2. Check the OBO token cache (synthetic account row)
@@ -282,7 +222,7 @@ export async function exchangeOboToken(
     cachedAccount.accessTokenExpiresAt &&
     cachedAccount.accessTokenExpiresAt.getTime() - now > bufferMs
   ) {
-    // Valid cached token — return it as a MicrosoftOBOToken shape
+    // Valid cached token — reconstruct a MicrosoftOBOToken shape from stored fields
     return {
       data: {
         token_type: "Bearer",
@@ -360,5 +300,124 @@ export async function exchangeOboToken(
   return { data: oboToken, error: null };
 }
 
-// Re-export the error type so callers can type-narrow error responses
+// ---------------------------------------------------------------------------
+// Plugin
+// ---------------------------------------------------------------------------
+
+/**
+ * Better Auth server-side plugin for Microsoft On-Behalf-Of (OBO) token exchange.
+ *
+ * Registers the plugin and injects an `obo` helper object onto `auth.$context`
+ * so you can call `ctx.obo.exchangeToken(userId, applicationName)` directly
+ * after awaiting the context — no need to pass `pluginOptions` at the call site.
+ *
+ * The standalone `exchangeOboToken` export is also available for callers that
+ * prefer to pass options explicitly or do not use the plugin system.
+ *
+ * @example
+ * ```ts
+ * import { betterAuth } from "better-auth";
+ * import { oboPlugin } from "better-auth-obo";
+ *
+ * export const auth = betterAuth({
+ *   plugins: [
+ *     oboPlugin({
+ *       defaultConfig: {
+ *         socialProvider: "microsoft",
+ *         authority: "https://login.microsoftonline.com/my-tenant-id",
+ *         clientId: process.env.AZURE_CLIENT_ID!,
+ *         clientSecret: process.env.AZURE_CLIENT_SECRET!,
+ *       },
+ *       applications: {
+ *         graph:    { scopes: ["https://graph.microsoft.com/.default"] },
+ *         "my-api": { scopes: ["api://my-api/.default"] },
+ *       },
+ *     }),
+ *   ],
+ * });
+ *
+ * // On your server — options already bound, no import of pluginOptions needed:
+ * const ctx = await auth.$context;
+ * const { data, error } = await ctx.obo.exchangeToken(userId, "graph");
+ * ```
+ */
+export const oboPlugin = (options: OboPluginOptions) => {
+  return {
+    id: "obo-plugin",
+    options,
+
+    init(ctx) {
+      return {
+        context: {
+          obo: {
+            /**
+             * Exchange the user's stored Microsoft access token for an OBO token
+             * scoped to a named downstream application.
+             *
+             * The plugin options are already bound — only `userId` and
+             * `applicationName` (a key from `options.applications`) are needed.
+             *
+             * @param userId          Better Auth user ID to act on behalf of.
+             * @param applicationName Key from `options.applications`.
+             * @param fetchOptions    Optional `@better-fetch/fetch` overrides.
+             */
+            exchangeToken(
+              userId: string,
+              applicationName: string,
+              fetchOptions?: BetterFetchOption,
+            ): Promise<{ data: MicrosoftOBOToken | null; error: string | null }> {
+              return _exchangeOboToken(
+                ctx.internalAdapter,
+                options,
+                userId,
+                applicationName,
+                fetchOptions,
+              );
+            },
+          },
+        },
+      };
+    },
+  } satisfies BetterAuthPlugin;
+};
+
+// ---------------------------------------------------------------------------
+// Standalone helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Exchange the authenticated user's stored Microsoft access token for an OBO
+ * (On-Behalf-Of) token scoped to a downstream application.
+ *
+ * This is the standalone form of the helper — useful when you want to pass
+ * `pluginOptions` explicitly or when you are not using `oboPlugin`. If you
+ * have registered `oboPlugin`, prefer `(await auth.$context).obo.exchangeToken`
+ * instead, which has the options already bound.
+ *
+ * OBO tokens are **cached** in Better Auth's `account` table under a synthetic
+ * `providerId` of `"obo-<applicationName>"`. A cached token is reused as long
+ * as it expires more than 60 seconds in the future. Once expired, a fresh OBO
+ * exchange is made automatically using the user's stored Microsoft access token.
+ *
+ * @param auth            The Better Auth instance (from `betterAuth(...)`).
+ * @param pluginOptions   The same options object passed to `oboPlugin()`.
+ * @param userId          The Better Auth user ID to exchange on behalf of.
+ * @param applicationName A key from `pluginOptions.applications`.
+ * @param fetchOptions    Optional `@better-fetch/fetch` options (e.g. for testing).
+ *
+ * @returns `{ data: MicrosoftOBOToken, error: null }` on success,
+ *          `{ data: null, error: string }` on failure.
+ */
+export async function exchangeOboToken(
+  auth: AuthLike,
+  pluginOptions: OboPluginOptions,
+  userId: string,
+  applicationName: string,
+  fetchOptions?: BetterFetchOption,
+): Promise<{ data: MicrosoftOBOToken | null; error: string | null }> {
+  const ctx = await auth.$context;
+  return _exchangeOboToken(ctx.internalAdapter, pluginOptions, userId, applicationName, fetchOptions);
+}
+
+// Re-export types so callers can type-narrow responses and annotate options
 export type { MicrosoftOBOError, MicrosoftOBOToken, OboPluginOptions };

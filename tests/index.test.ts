@@ -466,3 +466,86 @@ describe("exchangeOboToken — token caching", () => {
     expect(data?.access_token).toBe("freshly-fetched-token");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Tests: ctx.obo.exchangeToken — via auth.$context
+// ---------------------------------------------------------------------------
+
+describe("ctx.obo.exchangeToken — via auth.$context", () => {
+  it("exposes ctx.obo on auth.$context after plugin registration", async () => {
+    const { auth } = await buildAuth();
+    const ctx = await auth.$context;
+    expect(ctx.obo).toBeDefined();
+    expect(typeof ctx.obo.exchangeToken).toBe("function");
+  });
+
+  it("returns the OBO token with options already bound", async () => {
+    const { auth, signInWithTestUser } = await buildAuth();
+    const { user } = await signInWithTestUser();
+
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.createAccount({
+      userId: user.id,
+      providerId: "microsoft",
+      accountId: "ms-account-id",
+      accessToken: "ms-access-token",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    const mockFetch = vi.fn(async () =>
+      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    // No pluginOptions argument — options are bound at plugin init time
+    const { data, error } = await ctx.obo.exchangeToken(
+      user.id,
+      "graph",
+      { customFetchImpl: mockFetch as never },
+    );
+
+    expect(error).toBeNull();
+    expect(data?.access_token).toBe("obo-access-token-xyz");
+    expect(data?.token_type).toBe("Bearer");
+  });
+
+  it("uses the same cache as the standalone helper", async () => {
+    const { auth, signInWithTestUser } = await buildAuth();
+    const { user } = await signInWithTestUser();
+
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.createAccount({
+      userId: user.id,
+      providerId: "microsoft",
+      accountId: "ms-account-id",
+      accessToken: "ms-access-token",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    const mockFetch = vi.fn(async () =>
+      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    // First call via the standalone helper — populates the cache
+    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "graph", {
+      customFetchImpl: mockFetch as never,
+    });
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    // Second call via ctx.obo — should hit the same cache, no new HTTP request
+    const { data, error } = await ctx.obo.exchangeToken(
+      user.id,
+      "graph",
+      { customFetchImpl: mockFetch as never },
+    );
+
+    expect(mockFetch).toHaveBeenCalledTimes(1); // still 1
+    expect(error).toBeNull();
+    expect(data?.access_token).toBe("obo-access-token-xyz");
+  });
+});
