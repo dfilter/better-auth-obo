@@ -7,6 +7,16 @@ import {
 } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
+// Shared Microsoft social provider config (used in fallback tests)
+// ---------------------------------------------------------------------------
+
+const MS_SOCIAL_CONFIG = {
+  clientId: "ms-social-client-id",
+  clientSecret: "ms-social-client-secret",
+  tenantId: "ms-social-tenant-id",
+};
+
+// ---------------------------------------------------------------------------
 // Shared plugin config
 // ---------------------------------------------------------------------------
 
@@ -121,7 +131,9 @@ describe("exchangeOboToken — config resolution", () => {
     );
   });
 
-  it("returns an error when neither authority nor tenantId is provided", async () => {
+  it("standalone helper returns an error when no authority or tenantId can be resolved", async () => {
+    // The standalone helper has no social provider context, so missing
+    // authority/tenantId in defaultConfig cannot be recovered.
     const badOptions: OboPluginOptions = {
       defaultConfig: {
         clientId: "test-client-id",
@@ -614,5 +626,150 @@ describe("ctx.obo.exchangeToken — via auth.$context", () => {
     expect(mockFetch).toHaveBeenCalledTimes(1); // still 1
     expect(error).toBeNull();
     expect(data?.access_token).toBe("obo-access-token-xyz");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: credential fallback from Microsoft social provider config
+// ---------------------------------------------------------------------------
+
+describe("credential fallback from Microsoft social provider", () => {
+  it("reads clientId, clientSecret, and tenantId from the social provider when defaultConfig is omitted", async () => {
+    const { auth, signInWithTestUser } = await getTestInstance({
+      socialProviders: { microsoft: MS_SOCIAL_CONFIG },
+      plugins: [
+        oboPlugin({
+          // No defaultConfig — all credentials come from the social provider
+          applications: {
+            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+          },
+        }),
+      ],
+    });
+    const { user } = await signInWithTestUser();
+
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.createAccount({
+      userId: user.id,
+      providerId: "microsoft",
+      accountId: "ms-account-id",
+      accessToken: "ms-access-token",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    let capturedUrl: string | undefined;
+    let capturedBody: URLSearchParams | undefined;
+    const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = url.toString();
+      capturedBody = init?.body as URLSearchParams;
+      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const { data, error } = await ctx.obo.exchangeToken(
+      user.id,
+      "graph",
+      { customFetchImpl: mockFetch as never },
+    );
+
+    expect(error).toBeNull();
+    expect(data?.access_token).toBe("obo-access-token-xyz");
+
+    // Credentials from the social provider config
+    expect(capturedBody?.get("client_id")).toBe("ms-social-client-id");
+    expect(capturedBody?.get("client_secret")).toBe("ms-social-client-secret");
+    expect(capturedUrl).toContain("ms-social-tenant-id");
+  });
+
+  it("defaultConfig fields take precedence over the social provider config", async () => {
+    const { auth, signInWithTestUser } = await getTestInstance({
+      socialProviders: { microsoft: MS_SOCIAL_CONFIG },
+      plugins: [
+        oboPlugin({
+          defaultConfig: {
+            // Override only tenantId — clientId/clientSecret fall back to social provider
+            tenantId: "override-tenant-id",
+          },
+          applications: {
+            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+          },
+        }),
+      ],
+    });
+    const { user } = await signInWithTestUser();
+
+    const ctx = await auth.$context;
+    await ctx.internalAdapter.createAccount({
+      userId: user.id,
+      providerId: "microsoft",
+      accountId: "ms-account-id",
+      accessToken: "ms-access-token",
+      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    let capturedUrl: string | undefined;
+    let capturedBody: URLSearchParams | undefined;
+    const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = url.toString();
+      capturedBody = init?.body as URLSearchParams;
+      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    await ctx.obo.exchangeToken(user.id, "graph", {
+      customFetchImpl: mockFetch as never,
+    });
+
+    // tenantId from defaultConfig takes precedence
+    expect(capturedUrl).toContain("override-tenant-id");
+    expect(capturedUrl).not.toContain("ms-social-tenant-id");
+    // clientId/clientSecret fall back to social provider
+    expect(capturedBody?.get("client_id")).toBe("ms-social-client-id");
+    expect(capturedBody?.get("client_secret")).toBe("ms-social-client-secret");
+  });
+
+  it("warns when tenantId is explicitly set to 'common'", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await getTestInstance({
+      socialProviders: {
+        microsoft: {
+          clientId: "ms-client-id",
+          clientSecret: "ms-client-secret",
+          tenantId: "common", // explicitly set to the multi-tenant value
+        },
+      },
+      plugins: [
+        oboPlugin({
+          applications: {
+            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+          },
+        }),
+      ],
+    });
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("common"),
+    );
+    warnSpy.mockRestore();
+  });
+
+  it("plugin init throws at startup when no credentials can be resolved", async () => {
+    // No socialProviders.microsoft, no defaultConfig credentials
+    await expect(
+      getTestInstance({
+        plugins: [
+          oboPlugin({
+            applications: {
+              graph: { scopes: ["https://graph.microsoft.com/.default"] },
+            },
+          }),
+        ],
+      }),
+    ).rejects.toThrow("Missing required credentials");
   });
 });
