@@ -3,7 +3,6 @@ import { isAPIError } from "better-auth/api";
 import { getTestInstance } from "better-auth/test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  getOboToken,
   OBO_ERROR_CODES,
   oboPlugin,
   type GetOboTokenParams,
@@ -520,80 +519,6 @@ describe("auth.api.getOboToken — token caching", () => {
 
     expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(account.accessToken).toBe("freshly-fetched-token");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Tests: standalone getOboToken helper
-// ---------------------------------------------------------------------------
-
-describe("standalone getOboToken helper", () => {
-  it("throws BetterAuthError when no authority or tenantId can be resolved", async () => {
-    const badOptions: OboPluginOptions = {
-      defaultConfig: {
-        clientId: "test-client-id",
-        clientSecret: "test-client-secret",
-      },
-      applications: {
-        graph: { scope: ["https://graph.microsoft.com/.default"] },
-      },
-    };
-    const { auth } = await buildAuth();
-
-    await expect(
-      getOboToken(auth, badOptions, { userId: "any-user", applicationName: "graph" }),
-    ).rejects.toThrow("authority");
-  });
-
-  it("returns an Account on success with explicit credentials via fetchOptions", async () => {
-    const { auth, signInWithTestUser } = await buildAuth();
-    const { user } = await signInWithTestUser();
-    const ctx = await auth.$context;
-    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
-
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-
-    const account = await getOboToken(auth, PLUGIN_OPTIONS, {
-      userId: user.id,
-      applicationName: "graph",
-      fetchOptions: { customFetchImpl: mockFetch as never },
-    });
-
-    expect(account.accessToken).toBe("obo-access-token-xyz");
-    expect(account.providerId).toBe("obo-graph");
-  });
-
-  it("shares the cache with auth.api.getOboToken", async () => {
-    const { auth, signInWithTestUser } = await buildAuth();
-    const { user } = await signInWithTestUser();
-    const ctx = await auth.$context;
-    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
-
-    const standaloneMock = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-    await getOboToken(auth, PLUGIN_OPTIONS, {
-      userId: user.id,
-      applicationName: "graph",
-      fetchOptions: { customFetchImpl: standaloneMock as never },
-    });
-    expect(standaloneMock).toHaveBeenCalledTimes(1);
-
-    const apiFetchMock = stubFetch();
-    const account = await auth.api.getOboToken({
-      body: { userId: user.id, applicationName: "graph" },
-    });
-
-    expect(apiFetchMock).not.toHaveBeenCalled();
-    expect(account.accessToken).toBe("obo-access-token-xyz");
   });
 });
 

@@ -18,7 +18,7 @@
 import { isAPIError } from "better-auth/api";
 import { getTestInstance } from "better-auth/test";
 import { describe, expect, it } from "vitest";
-import { getOboToken, OBO_ERROR_CODES, oboPlugin, type OboPluginOptions } from "../src/index.js";
+import { OBO_ERROR_CODES, oboPlugin } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
 // Guard — skip everything when credentials are not available
@@ -134,53 +134,6 @@ describe("OBO integration — real Entra ID token exchange", () => {
 
       expect(second.id).toBe(first.id);
       expect(second.accessToken).toBe(first.accessToken);
-    },
-    30_000,
-  );
-
-  it.skipIf(!hasCredentials)(
-    "standalone getOboToken with explicit defaultConfig performs a successful exchange",
-    async () => {
-      const { auth, signInWithTestUser } = await getTestInstance({
-        plugins: [
-          oboPlugin({
-            defaultConfig: {
-              clientId: process.env.VITE_ENTRA_CLIENT_ID!,
-              clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
-              tenantId: process.env.VITE_ENTRA_TENANT_ID!,
-            },
-            applications: { downstream: { scope: oboScope } },
-          }),
-        ],
-      });
-      const { user } = await signInWithTestUser();
-      const ctx = await auth.$context;
-
-      await ctx.internalAdapter.createAccount({
-        userId: user.id,
-        providerId: "microsoft",
-        accountId: user.id,
-        accessToken: process.env.VITE_ENTRA_ACCESS_TOKEN!,
-        accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-      });
-
-      const pluginOptions: OboPluginOptions = {
-        defaultConfig: {
-          clientId: process.env.VITE_ENTRA_CLIENT_ID!,
-          clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
-          tenantId: process.env.VITE_ENTRA_TENANT_ID!,
-        },
-        applications: { downstream: { scope: oboScope } },
-      };
-
-      const account = await getOboToken(auth, pluginOptions, {
-        userId: user.id,
-        applicationName: "downstream",
-      });
-
-      expect(typeof account.accessToken).toBe("string");
-      expect(account.accessToken!.length).toBeGreaterThan(0);
-      expect(account.providerId).toBe("obo-downstream");
     },
     30_000,
   );

@@ -63,9 +63,7 @@ export const auth = betterAuth({
 
 ## Usage
 
-### Via `auth.api` (recommended — idiomatic Better Auth)
-
-The plugin exposes `auth.api.getOboToken` — the same pattern used by all major Better Auth plugins (`auth.api.banUser`, `auth.api.createOrganization`, etc.). Better Auth calls the handler directly without making an HTTP request, and without you needing to await `$context`.
+The plugin exposes `auth.api.getOboToken` — the same pattern used by all major Better Auth plugins (`auth.api.banUser`, `auth.api.createOrganization`, etc.). Better Auth calls the handler directly without making an HTTP request.
 
 On failure the endpoint throws an `APIError`. Catch it with `isAPIError` from `better-auth/api` and check `e.body.code` against `OBO_ERROR_CODES` for programmatic handling.
 
@@ -92,31 +90,6 @@ try {
     console.error(e.status, e.body?.code, e.body?.message);
   }
 }
-```
-
-### Via the standalone helper
-
-The exported `getOboToken` function is useful when you need to pass a custom `fetchOptions` (e.g. in tests with a mock fetch implementation), or when you prefer an explicit options-passing style. When using this form, `defaultConfig` must contain all required credential fields since there is no social provider context to fall back to.
-
-Throws `BetterAuthError` for misconfiguration, `APIError` for request-time failures.
-
-```ts
-import { getOboToken } from "better-auth-obo";
-import { auth } from "./auth";
-
-const pluginOptions = {
-  defaultConfig: {
-    clientId:     process.env.AZURE_CLIENT_ID!,
-    clientSecret: process.env.AZURE_CLIENT_SECRET!,
-    tenantId:     process.env.AZURE_TENANT_ID!,
-  },
-  applications: {
-    "my-api": { scope: ["api://my-downstream-app-id/.default"] },
-  },
-};
-
-const account = await getOboToken(auth, pluginOptions, { userId, applicationName: "my-api" });
-console.log(account.accessToken);
 ```
 
 ---

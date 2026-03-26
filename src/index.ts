@@ -4,16 +4,6 @@ import { APIError, BetterAuthError, defineErrorCodes } from "better-auth";
 import { createAuthEndpoint } from "better-auth/api";
 import { z } from "zod";
 
-/**
- * Minimal structural type for a Better Auth instance.
- * Using a structural type instead of the concrete `Auth<Options>` ensures
- * that `getOboToken` is compatible with any `Auth<Options>` regardless of
- * how narrowly TypeScript has inferred the `Options` type parameter.
- */
-export type AuthLike = {
-  $context: Promise<{ internalAdapter: InternalAdapter }>;
-};
-
 // ---------------------------------------------------------------------------
 // Error codes
 // ---------------------------------------------------------------------------
@@ -43,12 +33,10 @@ export type AuthLike = {
 export const OBO_ERROR_CODES = defineErrorCodes({
   UNKNOWN_APPLICATION:
     "The requested application is not configured in oboPlugin",
-  MISSING_APPLICATION_SCOPE:
-    "The application config is missing required scope",
+  MISSING_APPLICATION_SCOPE: "The application config is missing required scope",
   MICROSOFT_ACCOUNT_NOT_FOUND:
     "No Microsoft access token found for this user — ensure the user signed in via the Microsoft social provider",
-  OBO_EXCHANGE_FAILED:
-    "The OBO token exchange with Microsoft Entra ID failed",
+  OBO_EXCHANGE_FAILED: "The OBO token exchange with Microsoft Entra ID failed",
   MISSING_CREDENTIALS:
     "Required OBO credentials could not be resolved — provide them in oboPlugin({ defaultConfig }) or configure the Microsoft social provider",
 });
@@ -119,13 +107,8 @@ type ApplicationsConfig = {
 
 /**
  * Options passed to `oboPlugin()`.
- *
- * Generic over `TApplications` so that `applicationName` in `GetOboTokenParams`
- * is narrowed to the exact keys of the `applications` object you provide.
  */
-type OboPluginOptions<
-  TApplications extends ApplicationsConfig = ApplicationsConfig,
-> = {
+type OboPluginOptions = {
   /**
    * Middle-tier application credentials and token endpoint overrides.
    * Any field omitted here is read from the Microsoft social provider config.
@@ -138,22 +121,17 @@ type OboPluginOptions<
    * Named downstream applications to exchange tokens for.
    * Keys become the valid values for `applicationName` in `GetOboTokenParams`.
    */
-  applications: TApplications;
+  applications: ApplicationsConfig;
 };
 
 /**
  * Parameters for the standalone `getOboToken` helper.
- *
- * Generic over `TApplications` so `applicationName` is narrowed to the exact
- * keys of the `applications` object passed to `oboPlugin`.
  */
-export type GetOboTokenParams<
-  TApplications extends ApplicationsConfig = ApplicationsConfig,
-> = {
+export type GetOboTokenParams = {
   /** The Better Auth user ID to act on behalf of. */
   userId: string;
   /** A key from the `applications` config passed to `oboPlugin`. */
-  applicationName: keyof TApplications & string;
+  applicationName: string;
   /** Optional `@better-fetch/fetch` overrides (e.g. custom fetch impl for tests). */
   fetchOptions?: BetterFetchOption;
 };
@@ -301,8 +279,7 @@ function resolveConfig(
   if (!appConfig.scope?.length) {
     throw APIError.from("BAD_REQUEST", {
       ...OBO_ERROR_CODES.MISSING_APPLICATION_SCOPE,
-      message:
-        `${OBO_ERROR_CODES.MISSING_APPLICATION_SCOPE.message}: "${applicationName}"`,
+      message: `${OBO_ERROR_CODES.MISSING_APPLICATION_SCOPE.message}: "${applicationName}"`,
     });
   }
   return { ...credentials, ...appConfig };
@@ -353,11 +330,11 @@ function fetchOboToken(
  * Throws `APIError` on all failure cases so that `auth.api` re-throws to the
  * caller and the standalone helper propagates the error naturally.
  */
-async function _getOboToken<TApplications extends ApplicationsConfig>(
+async function _getOboToken(
   adapter: InternalAdapter,
   credentials: ResolvedCredentials,
-  pluginOptions: OboPluginOptions<TApplications>,
-  params: GetOboTokenParams<TApplications>,
+  pluginOptions: OboPluginOptions,
+  params: GetOboTokenParams,
 ): Promise<Account> {
   const { userId, applicationName, fetchOptions } = params;
 
@@ -389,8 +366,7 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
   if (!msAccount?.accessToken) {
     throw APIError.from("NOT_FOUND", {
       ...OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND,
-      message:
-        `${OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND.message} (userId: "${userId}")`,
+      message: `${OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND.message} (userId: "${userId}")`,
     });
   }
 
@@ -506,9 +482,7 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
  * }
  * ```
  */
-export const oboPlugin = <TApplications extends ApplicationsConfig>(
-  options: OboPluginOptions<TApplications>,
-) => {
+export const oboPlugin = (options: OboPluginOptions) => {
   // Credentials are resolved lazily on first endpoint call so that the social
   // provider config (from AuthContext) is available at that point. Once resolved
   // the result is cached for the lifetime of the plugin instance.
@@ -561,7 +535,8 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
                 "account table and reused until within 60 seconds of expiry.",
               responses: {
                 200: {
-                  description: "The cached Better Auth Account row for the OBO token",
+                  description:
+                    "The cached Better Auth Account row for the OBO token",
                   content: {
                     "application/json": {
                       schema: { $ref: "#/components/schemas/Account" },
@@ -600,54 +575,6 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
     },
   } satisfies BetterAuthPlugin;
 };
-
-// ---------------------------------------------------------------------------
-// Standalone helper
-// ---------------------------------------------------------------------------
-
-/**
- * Get an OBO (On-Behalf-Of) token for the given user and downstream application.
- *
- * This is the standalone form of the helper — useful when you want to pass
- * credentials explicitly, pass a custom `fetchOptions` (e.g. in tests), or
- * avoid `auth.api` entirely. If you have registered `oboPlugin`, prefer
- * `auth.api.getOboToken({ body: { ... } })` instead — it is the idiomatic
- * Better Auth server-side call pattern.
- *
- * When called standalone, `pluginOptions.defaultConfig` must contain all
- * required credential fields (`clientId`, `clientSecret`, and `authority` or
- * `tenantId`) because there is no social provider context to fall back to.
- *
- * Throws `APIError` on request-time failures and `BetterAuthError` on
- * misconfiguration — both propagate to the caller without wrapping.
- *
- * @param auth          The Better Auth instance (from `betterAuth(...)`).
- * @param pluginOptions The same options object passed to `oboPlugin()`.
- * @param params        `{ userId, applicationName, fetchOptions? }`
- *
- * @returns The Better Auth `Account` row for the cached OBO token.
- * @throws  `BetterAuthError` if credentials are missing from `defaultConfig`.
- * @throws  `APIError` for request-time failures (BAD_REQUEST, NOT_FOUND, BAD_GATEWAY).
- */
-export async function getOboToken(
-  auth: AuthLike,
-  pluginOptions: OboPluginOptions,
-  params: GetOboTokenParams,
-): Promise<Account> {
-  // No social provider context available here — defaultConfig must be complete.
-  // resolveCredentials throws BetterAuthError if anything is missing.
-  const resolvedCredentials = resolveCredentials(
-    pluginOptions.defaultConfig,
-    undefined,
-  );
-  const ctx = await auth.$context;
-  return _getOboToken(
-    ctx.internalAdapter,
-    resolvedCredentials,
-    pluginOptions,
-    params,
-  );
-}
 
 // Re-export types so callers can annotate options and params
 export type { OboPluginOptions };
