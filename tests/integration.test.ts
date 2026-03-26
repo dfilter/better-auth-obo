@@ -8,16 +8,17 @@
  *   VITE_ENTRA_CLIENT_ID      – middle-tier app client ID
  *   VITE_ENTRA_CLIENT_SECRET  – middle-tier app client secret
  *   VITE_ENTRA_TENANT_ID      – Azure AD tenant ID (must be specific, not "common")
- *   VITE_ENTRA_OBO_SCOPE     – comma-separated downstream scope
+ *   VITE_ENTRA_OBO_SCOPE      – comma-separated downstream scope
  *   VITE_ENTRA_ACCESS_TOKEN   – a valid delegated access token issued to VITE_ENTRA_CLIENT_ID
  *
  * All tests are skipped when any of the above variables are absent so that CI
  * without secrets does not fail.
  */
 
+import { isAPIError } from "better-auth/api";
 import { getTestInstance } from "better-auth/test";
 import { describe, expect, it } from "vitest";
-import { getOboToken, oboPlugin, type OboPluginOptions } from "../src/index.js";
+import { getOboToken, OBO_ERROR_CODES, oboPlugin, type OboPluginOptions } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
 // Guard — skip everything when credentials are not available
@@ -27,10 +28,10 @@ const hasCredentials =
   !!process.env.VITE_ENTRA_CLIENT_ID &&
   !!process.env.VITE_ENTRA_CLIENT_SECRET &&
   !!process.env.VITE_ENTRA_TENANT_ID &&
-  !!process.env.VITE_ENTRA_OBO_SCOPE &&
+  !!(process.env.VITE_ENTRA_OBO_SCOPE ?? process.env.VITE_ENTRA_OBO_SCOPES) &&
   !!process.env.VITE_ENTRA_ACCESS_TOKEN;
 
-const oboscope = (process.env.VITE_ENTRA_OBO_SCOPE ?? "")
+const oboScope = (process.env.VITE_ENTRA_OBO_SCOPE ?? process.env.VITE_ENTRA_OBO_SCOPES ?? "")
   .split(",")
   .filter(Boolean);
 
@@ -49,7 +50,7 @@ async function buildIntegrationAuth() {
     },
     plugins: [
       oboPlugin({
-        applications: { downstream: { scope: oboscope } },
+        applications: { downstream: { scope: oboScope } },
       }),
     ],
   });
@@ -78,25 +79,19 @@ describe("OBO integration — real Entra ID token exchange", () => {
     async () => {
       const { auth, user } = await buildIntegrationAuth();
 
-      const result = await auth.api.getOboToken({
+      const account = await auth.api.getOboToken({
         body: { userId: user.id, applicationName: "downstream" },
       });
 
-      expect(result.success).toBe(true);
-      if (!result.success) return;
-
-      expect(typeof result.data.accessToken).toBe("string");
-      expect(result.data.accessToken!.length).toBeGreaterThan(0);
-      expect(result.data.providerId).toBe("obo-downstream");
-      expect(result.data.userId).toBe(user.id);
-      expect(result.data.accessTokenExpiresAt).toBeInstanceOf(Date);
-      expect(result.data.accessTokenExpiresAt!.getTime()).toBeGreaterThan(
-        Date.now(),
-      );
-      const returnedscope = (result.data.scope ?? "").split(" ");
-      const requestedscope = oboscope.flatMap((s) => s.split(" "));
-      expect(returnedscope.some((s) => requestedscope.includes(s))).toBe(true);
-      expect(result.error).toBeNull();
+      expect(typeof account.accessToken).toBe("string");
+      expect(account.accessToken!.length).toBeGreaterThan(0);
+      expect(account.providerId).toBe("obo-downstream");
+      expect(account.userId).toBe(user.id);
+      expect(account.accessTokenExpiresAt).toBeInstanceOf(Date);
+      expect(account.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+      const returnedScope = (account.scope ?? "").split(" ");
+      const requestedScope = oboScope.flatMap((s) => s.split(" "));
+      expect(returnedScope.some((s) => requestedScope.includes(s))).toBe(true);
     },
     30_000,
   );
@@ -119,9 +114,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
       expect(typeof cached?.accessToken).toBe("string");
       expect(cached!.accessToken!.length).toBeGreaterThan(0);
       expect(cached?.accessTokenExpiresAt).toBeInstanceOf(Date);
-      expect(cached!.accessTokenExpiresAt!.getTime()).toBeGreaterThan(
-        Date.now(),
-      );
+      expect(cached!.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
     },
     30_000,
   );
@@ -134,17 +127,13 @@ describe("OBO integration — real Entra ID token exchange", () => {
       const first = await auth.api.getOboToken({
         body: { userId: user.id, applicationName: "downstream" },
       });
-      expect(first.success).toBe(true);
-      if (!first.success) return;
 
       const second = await auth.api.getOboToken({
         body: { userId: user.id, applicationName: "downstream" },
       });
-      expect(second.success).toBe(true);
-      if (!second.success) return;
 
-      expect(second.data.id).toBe(first.data.id);
-      expect(second.data.accessToken).toBe(first.data.accessToken);
+      expect(second.id).toBe(first.id);
+      expect(second.accessToken).toBe(first.accessToken);
     },
     30_000,
   );
@@ -160,7 +149,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
               clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
               tenantId: process.env.VITE_ENTRA_TENANT_ID!,
             },
-            applications: { downstream: { scope: oboscope } },
+            applications: { downstream: { scope: oboScope } },
           }),
         ],
       });
@@ -181,26 +170,23 @@ describe("OBO integration — real Entra ID token exchange", () => {
           clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
           tenantId: process.env.VITE_ENTRA_TENANT_ID!,
         },
-        applications: { downstream: { scope: oboscope } },
+        applications: { downstream: { scope: oboScope } },
       };
 
-      const result = await getOboToken(auth, pluginOptions, {
+      const account = await getOboToken(auth, pluginOptions, {
         userId: user.id,
         applicationName: "downstream",
       });
 
-      expect(result.success).toBe(true);
-      if (!result.success) return;
-
-      expect(typeof result.data.accessToken).toBe("string");
-      expect(result.data.accessToken!.length).toBeGreaterThan(0);
-      expect(result.data.providerId).toBe("obo-downstream");
+      expect(typeof account.accessToken).toBe("string");
+      expect(account.accessToken!.length).toBeGreaterThan(0);
+      expect(account.providerId).toBe("obo-downstream");
     },
     30_000,
   );
 
   it.skipIf(!hasCredentials)(
-    "returns success: false with a structured error when the assertion token is invalid",
+    "throws APIError BAD_GATEWAY / OBO_EXCHANGE_FAILED with Entra ID error details when assertion is invalid",
     async () => {
       const { auth, signInWithTestUser } = await getTestInstance({
         socialProviders: {
@@ -212,7 +198,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
         },
         plugins: [
           oboPlugin({
-            applications: { downstream: { scope: oboscope } },
+            applications: { downstream: { scope: oboScope } },
           }),
         ],
       });
@@ -227,13 +213,21 @@ describe("OBO integration — real Entra ID token exchange", () => {
         accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
       });
 
-      const result = await auth.api.getOboToken({
-        body: { userId: user.id, applicationName: "downstream" },
-      });
-
-      expect(result.success).toBe(false);
-      expect(result.data).toBeNull();
-      expect(result.error).toContain("OBO token exchange failed");
+      try {
+        await auth.api.getOboToken({
+          body: { userId: user.id, applicationName: "downstream" },
+        });
+        expect.fail("Expected APIError to be thrown");
+      } catch (e) {
+        expect(isAPIError(e)).toBe(true);
+        if (isAPIError(e)) {
+          expect(e.status).toBe("BAD_GATEWAY");
+          expect(e.body?.code).toBe(OBO_ERROR_CODES.OBO_EXCHANGE_FAILED.code);
+          // Entra ID error fields should be present on the body
+          expect(typeof e.body?.error).toBe("string");
+          expect(typeof e.body?.error_description).toBe("string");
+        }
+      }
     },
     30_000,
   );

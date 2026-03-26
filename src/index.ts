@@ -1,5 +1,6 @@
 import { betterFetch, type BetterFetchOption } from "@better-fetch/fetch";
 import type { Account, BetterAuthPlugin, InternalAdapter } from "better-auth";
+import { APIError, BetterAuthError, defineErrorCodes } from "better-auth";
 import { createAuthEndpoint } from "better-auth/api";
 import { z } from "zod";
 
@@ -12,6 +13,45 @@ import { z } from "zod";
 export type AuthLike = {
   $context: Promise<{ internalAdapter: InternalAdapter }>;
 };
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+
+/**
+ * Machine-readable error codes for the OBO plugin.
+ * These are registered on `auth.$ERROR_CODES` and included in the `code`
+ * field of thrown `APIError` instances.
+ *
+ * @example
+ * ```ts
+ * import { isAPIError } from "better-auth/api";
+ *
+ * try {
+ *   const account = await auth.api.getOboToken({ body: { userId, applicationName: "graph" } });
+ * } catch (e) {
+ *   if (isAPIError(e)) {
+ *     switch (e.body.code) {
+ *       case "MICROSOFT_ACCOUNT_NOT_FOUND": // user hasn't signed in via Microsoft
+ *       case "OBO_EXCHANGE_FAILED":          // Entra ID rejected the exchange
+ *       case "UNKNOWN_APPLICATION":          // applicationName not in plugin config
+ *     }
+ *   }
+ * }
+ * ```
+ */
+export const OBO_ERROR_CODES = defineErrorCodes({
+  UNKNOWN_APPLICATION:
+    "The requested application is not configured in oboPlugin",
+  MISSING_APPLICATION_SCOPE:
+    "The application config is missing required scope",
+  MICROSOFT_ACCOUNT_NOT_FOUND:
+    "No Microsoft access token found for this user — ensure the user signed in via the Microsoft social provider",
+  OBO_EXCHANGE_FAILED:
+    "The OBO token exchange with Microsoft Entra ID failed",
+  MISSING_CREDENTIALS:
+    "Required OBO credentials could not be resolved — provide them in oboPlugin({ defaultConfig }) or configure the Microsoft social provider",
+});
 
 // ---------------------------------------------------------------------------
 // Types
@@ -118,28 +158,7 @@ export type GetOboTokenParams<
   fetchOptions?: BetterFetchOption;
 };
 
-/**
- * Discriminated union returned by `getOboToken`.
- *
- * When `success` is `true`, `data` is the Better Auth `Account` row for the
- * cached OBO token and `error` is `null`. When `success` is `false`, `data`
- * is `null` and `error` is a string describing what went wrong.
- *
- * @example
- * ```ts
- * const result = await auth.api.getOboToken({ body: { userId, applicationName: "graph" } });
- * if (result.success) {
- *   result.data.accessToken  // string | null | undefined
- * } else {
- *   console.error(result.error);
- * }
- * ```
- */
-export type OboResult =
-  | { success: true; data: Account; error: null }
-  | { success: false; data: null; error: string };
-
-/** Raw response from the Microsoft token endpoint — internal only. */
+/** Successful response from the Microsoft token endpoint — internal only. */
 type MicrosoftOBOToken = {
   token_type: "Bearer";
   scope: string;
@@ -149,7 +168,12 @@ type MicrosoftOBOToken = {
   refresh_token?: string;
 };
 
-/** Error response from the Microsoft token endpoint. */
+/**
+ * The raw error response body returned by Microsoft Entra ID when an OBO
+ * exchange fails. These fields are spread onto the thrown `APIError`'s body
+ * alongside the standard `code` and `message` fields, so you can access them
+ * from `e.body` after catching an `APIError` with code `"OBO_EXCHANGE_FAILED"`.
+ */
 export type MicrosoftOBOError = {
   error: string;
   error_description?: string;
@@ -195,7 +219,8 @@ type MicrosoftProviderOptions = {
  * Emits a console warning if the effective `tenantId` is `"common"` or
  * `"organizations"`, since Microsoft explicitly discourages those for OBO.
  *
- * Throws if any required credential is missing after merging.
+ * Throws `BetterAuthError` if any required credential is missing — this is a
+ * developer misconfiguration caught at init/first-call time, not a request failure.
  */
 function resolveCredentials(
   defaultConfig: OboDefaultConfig | undefined,
@@ -230,10 +255,8 @@ function resolveCredentials(
   if (!baseAuthority) missing.push("authority (or tenantId)");
 
   if (missing.length > 0) {
-    throw new Error(
-      `[obo-plugin] Missing required credentials: ${missing.join(", ")}. ` +
-        `Provide them in oboPlugin({ defaultConfig }) or ensure the Microsoft ` +
-        `social provider is configured with these fields.`,
+    throw new BetterAuthError(
+      `${OBO_ERROR_CODES.MISSING_CREDENTIALS.message}. Missing: ${missing.join(", ")}.`,
     );
   }
 
@@ -257,6 +280,9 @@ function resolveCredentials(
 /**
  * Look up a per-application config and combine it with already-resolved
  * credentials to produce a fully resolved per-call config.
+ *
+ * Throws `APIError` (BAD_REQUEST) if the application name is unknown or
+ * its scope list is empty — these are caller errors.
  */
 function resolveConfig(
   credentials: ResolvedCredentials,
@@ -265,15 +291,19 @@ function resolveConfig(
 ): ResolvedConfig {
   const appConfig = pluginOptions.applications[applicationName];
   if (!appConfig) {
-    throw new Error(
-      `[obo-plugin] Unknown application "${applicationName}". ` +
+    throw APIError.from("BAD_REQUEST", {
+      ...OBO_ERROR_CODES.UNKNOWN_APPLICATION,
+      message:
+        `${OBO_ERROR_CODES.UNKNOWN_APPLICATION.message}: "${applicationName}". ` +
         `Available applications: ${Object.keys(pluginOptions.applications).join(", ")}`,
-    );
+    });
   }
   if (!appConfig.scope?.length) {
-    throw new Error(
-      `[obo-plugin] Missing required scope for application "${applicationName}".`,
-    );
+    throw APIError.from("BAD_REQUEST", {
+      ...OBO_ERROR_CODES.MISSING_APPLICATION_SCOPE,
+      message:
+        `${OBO_ERROR_CODES.MISSING_APPLICATION_SCOPE.message}: "${applicationName}"`,
+    });
   }
   return { ...credentials, ...appConfig };
 }
@@ -319,22 +349,20 @@ function fetchOboToken(
  * Internal implementation of the OBO token exchange.
  * Accepts pre-resolved `credentials` and the raw `InternalAdapter` directly
  * so it can be called from both the plugin endpoint and the standalone helper.
+ *
+ * Throws `APIError` on all failure cases so that `auth.api` re-throws to the
+ * caller and the standalone helper propagates the error naturally.
  */
 async function _getOboToken<TApplications extends ApplicationsConfig>(
   adapter: InternalAdapter,
   credentials: ResolvedCredentials,
   pluginOptions: OboPluginOptions<TApplications>,
   params: GetOboTokenParams<TApplications>,
-): Promise<OboResult> {
+): Promise<Account> {
   const { userId, applicationName, fetchOptions } = params;
 
-  // 1. Resolve per-application config
-  let config: ResolvedConfig;
-  try {
-    config = resolveConfig(credentials, pluginOptions, applicationName);
-  } catch (err) {
-    return { success: false, data: null, error: (err as Error).message };
-  }
+  // 1. Resolve per-application config (throws APIError BAD_REQUEST on invalid name/scope)
+  const config = resolveConfig(credentials, pluginOptions, applicationName);
 
   const providerId = oboProviderId(applicationName);
 
@@ -351,7 +379,7 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
     cachedAccount.accessTokenExpiresAt &&
     cachedAccount.accessTokenExpiresAt.getTime() - now > bufferMs
   ) {
-    return { success: true, data: cachedAccount, error: null };
+    return cachedAccount;
   }
 
   // 3. Look up the user's real Microsoft account to get the assertion token
@@ -359,13 +387,11 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
   const msAccount = accounts.find((a) => a.providerId === "microsoft");
 
   if (!msAccount?.accessToken) {
-    return {
-      success: false,
-      data: null,
-      error:
-        `[obo-plugin] No Microsoft access token found for user "${userId}". ` +
-        `Ensure the user signed in via the Microsoft social provider.`,
-    };
+    throw APIError.from("NOT_FOUND", {
+      ...OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND,
+      message:
+        `${OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND.message} (userId: "${userId}")`,
+    });
   }
 
   // 4. Perform the OBO token exchange
@@ -376,30 +402,30 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
   );
 
   if (fetchError || !oboToken) {
-    const detail =
-      fetchError instanceof Error
-        ? fetchError.message
-        : JSON.stringify(fetchError);
-    return {
-      success: false,
-      data: null,
-      error: `[obo-plugin] OBO token exchange failed: ${detail}`,
-    };
+    // Spread fetchError directly — it is typed as
+    // { status: number; statusText: string } & MicrosoftOBOError | null,
+    // so all Entra ID fields (error, error_description, error_codes, trace_id,
+    // correlation_id) are included. Spreading null is a no-op.
+    throw APIError.fromStatus("BAD_GATEWAY", {
+      message: OBO_ERROR_CODES.OBO_EXCHANGE_FAILED.message,
+      code: OBO_ERROR_CODES.OBO_EXCHANGE_FAILED.code,
+      ...fetchError,
+    });
   }
 
   // 5. Upsert the OBO token into the account table for caching.
   //    Both createAccount and updateAccount return the persisted Account row,
-  //    which we return directly as the result data.
+  //    which we return directly.
   const expiresAt = new Date(now + oboToken.expires_in * 1000);
   const tokenData = {
     accessToken: oboToken.access_token,
     accessTokenExpiresAt: expiresAt,
     scope: oboToken.scope,
-    ...(oboToken.refresh_token ? { refreshToken: oboToken.refresh_token } : {}),
+    refreshToken: oboToken.refresh_token,
   };
 
   try {
-    const account = cachedAccount
+    return cachedAccount
       ? await adapter.updateAccount(cachedAccount.id, tokenData)
       : await adapter.createAccount({
           userId,
@@ -407,11 +433,10 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
           accountId: userId, // no real "accountId" for an OBO token — use userId
           ...tokenData,
         });
-    return { success: true, data: account, error: null };
   } catch {
     // Caching failure is non-fatal — return a synthetic Account-shaped object
     // built from the exchange response so the caller still gets a usable token.
-    const synthetic: Account = {
+    return {
       id: cachedAccount?.id ?? "",
       createdAt: cachedAccount?.createdAt ?? new Date(now),
       updatedAt: new Date(now),
@@ -419,8 +444,7 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
       accountId: userId,
       userId,
       ...tokenData,
-    };
-    return { success: true, data: synthetic, error: null };
+    } satisfies Account;
   }
 }
 
@@ -441,10 +465,15 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
  * `auth.api.createOrganization`, etc.). No HTTP request is made; Better Auth
  * calls the handler directly.
  *
+ * On failure the endpoint throws an `APIError`. Catch it with `isAPIError` from
+ * `better-auth/api` and inspect `e.body.code` against `OBO_ERROR_CODES` for
+ * programmatic error handling.
+ *
  * @example
  * ```ts
  * import { betterAuth } from "better-auth";
  * import { oboPlugin } from "better-auth-obo";
+ * import { isAPIError } from "better-auth/api";
  *
  * export const auth = betterAuth({
  *   socialProviders: {
@@ -464,20 +493,25 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
  *   ],
  * });
  *
- * // On your server — same pattern as auth.api.banUser():
- * const result = await auth.api.getOboToken({
- *   body: { userId, applicationName: "graph" },
- * });
- * if (result.success) {
- *   result.data.accessToken  // string | null | undefined
+ * // On your server:
+ * try {
+ *   const account = await auth.api.getOboToken({
+ *     body: { userId, applicationName: "graph" },
+ *   });
+ *   account.accessToken // string | null | undefined
+ * } catch (e) {
+ *   if (isAPIError(e)) {
+ *     console.error(e.body.code, e.body.message);
+ *   }
  * }
  * ```
  */
 export const oboPlugin = <TApplications extends ApplicationsConfig>(
   options: OboPluginOptions<TApplications>,
 ) => {
-  // Credentials are resolved lazily on first endpoint call so that the
-  // social provider config (from AuthContext) is available at that point.
+  // Credentials are resolved lazily on first endpoint call so that the social
+  // provider config (from AuthContext) is available at that point. Once resolved
+  // the result is cached for the lifetime of the plugin instance.
   let credentials: ResolvedCredentials | undefined;
 
   function getCredentials(ctx: {
@@ -488,12 +522,15 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
     const msProviderOptions = msProvider?.options as
       | MicrosoftProviderOptions
       | undefined;
+    // resolveCredentials throws BetterAuthError if credentials are missing.
+    // We let it propagate so it surfaces as INTERNAL_SERVER_ERROR from the endpoint.
     credentials = resolveCredentials(options.defaultConfig, msProviderOptions);
     return credentials;
   }
 
   return {
     id: "obo-plugin",
+    $ERROR_CODES: OBO_ERROR_CODES,
     options,
 
     endpoints: {
@@ -503,9 +540,8 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
        * Called server-side via `auth.api.getOboToken({ body: { userId, applicationName } })`.
        * Better Auth invokes the handler directly without an HTTP request.
        *
-       * Returns an `OboResult` discriminated union — check `result.success` to narrow
-       * between the success (`result.data: Account`) and failure (`result.error: string`)
-       * branches.
+       * Throws an `APIError` on failure — check `e.body.code` against `OBO_ERROR_CODES`
+       * for programmatic handling. Returns the Better Auth `Account` row on success.
        */
       getOboToken: createAuthEndpoint(
         "/obo/get-token",
@@ -525,20 +561,16 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
                 "account table and reused until within 60 seconds of expiry.",
               responses: {
                 200: {
-                  description: "OBO token result",
+                  description: "The cached Better Auth Account row for the OBO token",
                   content: {
                     "application/json": {
-                      schema: {
-                        type: "object",
-                        properties: {
-                          success: { type: "boolean" },
-                          data: { type: "object", nullable: true },
-                          error: { type: "string", nullable: true },
-                        },
-                      },
+                      schema: { $ref: "#/components/schemas/Account" },
                     },
                   },
                 },
+                400: { description: "Unknown application or missing scope" },
+                404: { description: "User has no Microsoft access token" },
+                502: { description: "Entra ID rejected the OBO exchange" },
               },
             },
           },
@@ -548,11 +580,11 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
           try {
             resolvedCredentials = getCredentials(ctx.context);
           } catch (err) {
-            return {
-              success: false,
-              data: null,
-              error: (err as Error).message,
-            } satisfies OboResult;
+            // BetterAuthError from resolveCredentials → surface as 500
+            throw APIError.fromStatus("INTERNAL_SERVER_ERROR", {
+              message: (err as Error).message,
+              code: OBO_ERROR_CODES.MISSING_CREDENTIALS.code,
+            });
           }
           return _getOboToken(
             ctx.context.internalAdapter,
@@ -586,32 +618,28 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
  * required credential fields (`clientId`, `clientSecret`, and `authority` or
  * `tenantId`) because there is no social provider context to fall back to.
  *
- * OBO tokens are **cached** in Better Auth's `account` table under a synthetic
- * `providerId` of `"obo-<applicationName>"`. A cached token is reused as long
- * as it expires more than 60 seconds in the future. Once expired, a fresh OBO
- * exchange is made automatically using the user's stored Microsoft `accessToken`.
+ * Throws `APIError` on request-time failures and `BetterAuthError` on
+ * misconfiguration — both propagate to the caller without wrapping.
  *
  * @param auth          The Better Auth instance (from `betterAuth(...)`).
  * @param pluginOptions The same options object passed to `oboPlugin()`.
  * @param params        `{ userId, applicationName, fetchOptions? }`
  *
- * @returns An `OboResult` discriminated union — check `result.success` to narrow.
+ * @returns The Better Auth `Account` row for the cached OBO token.
+ * @throws  `BetterAuthError` if credentials are missing from `defaultConfig`.
+ * @throws  `APIError` for request-time failures (BAD_REQUEST, NOT_FOUND, BAD_GATEWAY).
  */
 export async function getOboToken(
   auth: AuthLike,
   pluginOptions: OboPluginOptions,
   params: GetOboTokenParams,
-): Promise<OboResult> {
-  let resolvedCredentials: ResolvedCredentials;
-  try {
-    // No social provider context available here — defaultConfig must be complete.
-    resolvedCredentials = resolveCredentials(
-      pluginOptions.defaultConfig,
-      undefined,
-    );
-  } catch (err) {
-    return { success: false, data: null, error: (err as Error).message };
-  }
+): Promise<Account> {
+  // No social provider context available here — defaultConfig must be complete.
+  // resolveCredentials throws BetterAuthError if anything is missing.
+  const resolvedCredentials = resolveCredentials(
+    pluginOptions.defaultConfig,
+    undefined,
+  );
   const ctx = await auth.$context;
   return _getOboToken(
     ctx.internalAdapter,
@@ -621,5 +649,5 @@ export async function getOboToken(
   );
 }
 
-// Re-export types so callers can type-narrow responses and annotate options
+// Re-export types so callers can annotate options and params
 export type { OboPluginOptions };

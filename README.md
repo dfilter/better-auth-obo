@@ -67,28 +67,38 @@ export const auth = betterAuth({
 
 The plugin exposes `auth.api.getOboToken` — the same pattern used by all major Better Auth plugins (`auth.api.banUser`, `auth.api.createOrganization`, etc.). Better Auth calls the handler directly without making an HTTP request, and without you needing to await `$context`.
 
+On failure the endpoint throws an `APIError`. Catch it with `isAPIError` from `better-auth/api` and check `e.body.code` against `OBO_ERROR_CODES` for programmatic handling.
+
 ```ts
 import { auth } from "./auth";
+import { isAPIError } from "better-auth/api";
 
-const result = await auth.api.getOboToken({
-  body: { userId, applicationName: "graph" },
-});
+try {
+  const account = await auth.api.getOboToken({
+    body: { userId, applicationName: "graph" },
+  });
 
-if (!result.success) {
-  console.error(result.error); // string
-  return;
+  // account is a Better Auth Account object
+  await fetch("https://graph.microsoft.com/v1.0/me", {
+    headers: { Authorization: `Bearer ${account.accessToken}` },
+  });
+} catch (e) {
+  if (isAPIError(e)) {
+    // e.status:        "NOT_FOUND" | "BAD_REQUEST" | "BAD_GATEWAY" | "INTERNAL_SERVER_ERROR"
+    // e.body.code:     one of OBO_ERROR_CODES (e.g. "MICROSOFT_ACCOUNT_NOT_FOUND")
+    // e.body.message:  human-readable description
+    // For OBO_EXCHANGE_FAILED, Entra ID error fields are also on e.body:
+    // e.body.error, e.body.error_description, e.body.error_codes, e.body.trace_id
+    console.error(e.status, e.body?.code, e.body?.message);
+  }
 }
-
-// result.data is a Better Auth Account object
-// result.data.accessToken holds the OBO access token
-await fetch("https://graph.microsoft.com/v1.0/me", {
-  headers: { Authorization: `Bearer ${result.data.accessToken}` },
-});
 ```
 
 ### Via the standalone helper
 
 The exported `getOboToken` function is useful when you need to pass a custom `fetchOptions` (e.g. in tests with a mock fetch implementation), or when you prefer an explicit options-passing style. When using this form, `defaultConfig` must contain all required credential fields since there is no social provider context to fall back to.
+
+Throws `BetterAuthError` for misconfiguration, `APIError` for request-time failures.
 
 ```ts
 import { getOboToken } from "better-auth-obo";
@@ -105,10 +115,8 @@ const pluginOptions = {
   },
 };
 
-const result = await getOboToken(auth, pluginOptions, { userId, applicationName: "my-api" });
-if (result.success) {
-  console.log(result.data.accessToken);
-}
+const account = await getOboToken(auth, pluginOptions, { userId, applicationName: "my-api" });
+console.log(account.accessToken);
 ```
 
 ---
@@ -135,18 +143,10 @@ if (result.success) {
 | Field | Type | Description |
 |---|---|---|
 | `userId` | `string` | The Better Auth user ID to act on behalf of. The user must have previously signed in via the Microsoft social provider. |
-| `applicationName` | `keyof applications & string` | A key from `options.applications`. Typed to your exact application names — typos are compile errors. |
+| `applicationName` | `string` | A key from `options.applications`. |
 | `fetchOptions` | `BetterFetchOption` | Optional. Advanced fetch overrides (custom fetch implementation, timeouts, etc.). |
 
-**Returns:** `Promise<OboResult>` — a discriminated union:
-
-```ts
-type OboResult =
-  | { success: true;  data: Account; error: null   }
-  | { success: false; data: null;    error: string };
-```
-
-On success (`result.success === true`), `result.data` is a Better Auth `Account` object containing the cached OBO token:
+**Returns:** `Promise<Account>` — the Better Auth `Account` row for the cached OBO token:
 
 | Field | Type | Description |
 |---|---|---|
@@ -157,7 +157,19 @@ On success (`result.success === true`), `result.data` is a Better Auth `Account`
 | `providerId` | `string` | Always `"obo-<applicationName>"`. |
 | `userId` | `string` | The Better Auth user ID. |
 
-On failure (`result.success === false`), `result.data` is `null` and `result.error` is a string describing the problem.
+**Throws:** `APIError` on failure. Check `e.status` and `e.body.code` against `OBO_ERROR_CODES`.
+
+### `OBO_ERROR_CODES`
+
+Machine-readable error codes registered on `auth.$ERROR_CODES`. Each value has `code` (string) and `message` (human-readable) fields.
+
+| Code | HTTP status | Description |
+|---|---|---|
+| `UNKNOWN_APPLICATION` | 400 | `applicationName` not found in plugin config |
+| `MISSING_APPLICATION_SCOPE` | 400 | Application config has an empty `scope` array |
+| `MICROSOFT_ACCOUNT_NOT_FOUND` | 404 | User has no Microsoft `accessToken` stored |
+| `OBO_EXCHANGE_FAILED` | 502 | Entra ID rejected the OBO exchange. Entra ID's `error`, `error_description`, `error_codes`, `trace_id`, and `correlation_id` are spread onto `e.body`. |
+| `MISSING_CREDENTIALS` | 500 | Required credentials missing from both `defaultConfig` and the social provider config |
 
 ---
 
@@ -204,7 +216,7 @@ Integration tests make real HTTP requests to the Microsoft Entra ID token endpoi
 VITE_ENTRA_CLIENT_ID=<your-middle-tier-app-client-id>
 VITE_ENTRA_CLIENT_SECRET=<your-client-secret>
 VITE_ENTRA_TENANT_ID=<your-tenant-id>
-VITE_ENTRA_OBO_scope=api://<downstream-app-id>/.default,offline_access
+VITE_ENTRA_OBO_SCOPE=api://<downstream-app-id>/.default,offline_access
 VITE_ENTRA_ACCESS_TOKEN=<a-valid-delegated-access-token>
 ```
 
@@ -213,7 +225,7 @@ VITE_ENTRA_ACCESS_TOKEN=<a-valid-delegated-access-token>
 | `VITE_ENTRA_CLIENT_ID` | Client ID of the middle-tier app registration. |
 | `VITE_ENTRA_CLIENT_SECRET` | Client secret of the middle-tier app registration. |
 | `VITE_ENTRA_TENANT_ID` | Your Azure AD tenant ID (a specific GUID, not `"common"`). |
-| `VITE_ENTRA_OBO_scope` | Comma-separated scope for the downstream application. |
+| `VITE_ENTRA_OBO_SCOPE` | Comma-separated scope for the downstream application. |
 | `VITE_ENTRA_ACCESS_TOKEN` | A valid delegated access token issued to `VITE_ENTRA_CLIENT_ID`. The `aud` claim must match the client ID. Obtain one via [MSAL](https://learn.microsoft.com/entra/msal/overview), [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer), or Postman. |
 
 ```bash

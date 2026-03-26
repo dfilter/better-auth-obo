@@ -35,7 +35,7 @@
     "build": "tsdown",
     "dev": "tsdown --watch",
     "test": "vitest",
-    "test:integration": "vitest run tests/integration.test.ts",
+    "test:integration": "node --env-file=.env.test node_modules/vitest/vitest.mjs run tests/integration.test.ts",
     "typecheck": "tsc --noEmit",
     "release": "bumpp",
     "prepublishOnly": "pnpm run build"
