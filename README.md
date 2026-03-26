@@ -63,19 +63,16 @@ export const auth = betterAuth({
 
 ## Usage
 
-### Via `auth.$context` (recommended)
+### Via `auth.api` (recommended — idiomatic Better Auth)
 
-The plugin injects an `obo` helper onto `auth.$context` at startup with credentials already bound. This is the cleanest call site — no credentials or options needed at the point of use.
-
-`applicationName` is statically typed to the exact keys of the `applications` object you passed to `oboPlugin`, so typos are caught at compile time.
+The plugin exposes `auth.api.getOboToken` — the same pattern used by all major Better Auth plugins (`auth.api.banUser`, `auth.api.createOrganization`, etc.). Better Auth calls the handler directly without making an HTTP request, and without you needing to await `$context`.
 
 ```ts
 import { auth } from "./auth";
 
-const ctx = await auth.$context;
-
-// applicationName is typed as "graph" | "my-api" — typos are a compile error
-const result = await ctx.obo.getOboToken({ userId, applicationName: "graph" });
+const result = await auth.api.getOboToken({
+  body: { userId, applicationName: "graph" },
+});
 
 if (!result.success) {
   console.error(result.error); // string
@@ -91,7 +88,7 @@ await fetch("https://graph.microsoft.com/v1.0/me", {
 
 ### Via the standalone helper
 
-If you need to pass credentials explicitly — for example when writing tests or in a context where the plugin is not registered — use the exported `getOboToken` function directly. When using this form, `defaultConfig` must contain all required credential fields since there is no social provider context to fall back to.
+The exported `getOboToken` function is useful when you need to pass a custom `fetchOptions` (e.g. in tests with a mock fetch implementation), or when you prefer an explicit options-passing style. When using this form, `defaultConfig` must contain all required credential fields since there is no social provider context to fall back to.
 
 ```ts
 import { getOboToken } from "better-auth-obo";
@@ -131,9 +128,9 @@ if (result.success) {
 
 \* Required collectively — after merging `defaultConfig` with the social provider config, `clientId`, `clientSecret`, and either `authority` or `tenantId` must all be resolvable. The plugin throws at startup if any are missing.
 
-### `ctx.obo.getOboToken(params)`
+### `auth.api.getOboToken({ body: params })`
 
-Accepts a single `GetOboTokenParams` object:
+`body` accepts a `GetOboTokenParams` object:
 
 | Field | Type | Description |
 |---|---|---|

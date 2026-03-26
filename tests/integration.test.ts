@@ -35,8 +35,7 @@ const oboScopes = (process.env.VITE_ENTRA_OBO_SCOPES ?? "")
   .filter(Boolean);
 
 // ---------------------------------------------------------------------------
-// Shared auth instance — credentials from the Microsoft social provider config
-// so that the credential-fallback path is exercised end-to-end.
+// Shared auth instance
 // ---------------------------------------------------------------------------
 
 async function buildIntegrationAuth() {
@@ -50,10 +49,7 @@ async function buildIntegrationAuth() {
     },
     plugins: [
       oboPlugin({
-        // No defaultConfig — all credentials fall back to the social provider above
-        applications: {
-          downstream: { scopes: oboScopes },
-        },
+        applications: { downstream: { scopes: oboScopes } },
       }),
     ],
   });
@@ -61,9 +57,6 @@ async function buildIntegrationAuth() {
   const { user } = await signInWithTestUser();
   const ctx = await auth.$context;
 
-  // Seed a microsoft account row for the test user containing the real
-  // access token. This mirrors what Better Auth stores after a real OAuth
-  // sign-in via the Microsoft social provider.
   await ctx.internalAdapter.createAccount({
     userId: user.id,
     providerId: "microsoft",
@@ -81,26 +74,23 @@ async function buildIntegrationAuth() {
 
 describe("OBO integration — real Entra ID token exchange", () => {
   it.skipIf(!hasCredentials)(
-    "ctx.obo.getOboToken performs a successful OBO exchange and returns an Account",
+    "auth.api.getOboToken performs a successful OBO exchange and returns an Account",
     async () => {
-      const { ctx, user } = await buildIntegrationAuth();
+      const { auth, user } = await buildIntegrationAuth();
 
-      const result = await ctx.obo.getOboToken({
-        userId: user.id,
-        applicationName: "downstream",
+      const result = await auth.api.getOboToken({
+        body: { userId: user.id, applicationName: "downstream" },
       });
 
       expect(result.success).toBe(true);
       if (!result.success) return;
 
-      // data is an Account-shaped object
       expect(typeof result.data.accessToken).toBe("string");
       expect(result.data.accessToken!.length).toBeGreaterThan(0);
       expect(result.data.providerId).toBe("obo-downstream");
       expect(result.data.userId).toBe(user.id);
       expect(result.data.accessTokenExpiresAt).toBeInstanceOf(Date);
       expect(result.data.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
-      // scope must contain at least one of the requested scopes
       const returnedScopes = (result.data.scope ?? "").split(" ");
       const requestedScopes = oboScopes.flatMap((s) => s.split(" "));
       expect(returnedScopes.some((s) => requestedScopes.includes(s))).toBe(true);
@@ -112,9 +102,11 @@ describe("OBO integration — real Entra ID token exchange", () => {
   it.skipIf(!hasCredentials)(
     "OBO token is written to the account cache after exchange",
     async () => {
-      const { ctx, user } = await buildIntegrationAuth();
+      const { auth, ctx, user } = await buildIntegrationAuth();
 
-      await ctx.obo.getOboToken({ userId: user.id, applicationName: "downstream" });
+      await auth.api.getOboToken({
+        body: { userId: user.id, applicationName: "downstream" },
+      });
 
       const cached = await ctx.internalAdapter.findAccountByProviderId(
         user.id,
@@ -133,25 +125,20 @@ describe("OBO integration — real Entra ID token exchange", () => {
   it.skipIf(!hasCredentials)(
     "second call returns the cached Account row without a new HTTP request",
     async () => {
-      const { ctx, user } = await buildIntegrationAuth();
+      const { auth, user } = await buildIntegrationAuth();
 
-      // First call — hits Entra ID, populates the cache
-      const first = await ctx.obo.getOboToken({
-        userId: user.id,
-        applicationName: "downstream",
+      const first = await auth.api.getOboToken({
+        body: { userId: user.id, applicationName: "downstream" },
       });
       expect(first.success).toBe(true);
       if (!first.success) return;
 
-      // Second call — served from the cached Account row
-      const second = await ctx.obo.getOboToken({
-        userId: user.id,
-        applicationName: "downstream",
+      const second = await auth.api.getOboToken({
+        body: { userId: user.id, applicationName: "downstream" },
       });
       expect(second.success).toBe(true);
       if (!second.success) return;
 
-      // Same token — both calls return the same Account id and accessToken
       expect(second.data.id).toBe(first.data.id);
       expect(second.data.accessToken).toBe(first.data.accessToken);
     },
@@ -169,9 +156,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
               clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
               tenantId: process.env.VITE_ENTRA_TENANT_ID!,
             },
-            applications: {
-              downstream: { scopes: oboScopes },
-            },
+            applications: { downstream: { scopes: oboScopes } },
           }),
         ],
       });
@@ -192,9 +177,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
           clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
           tenantId: process.env.VITE_ENTRA_TENANT_ID!,
         },
-        applications: {
-          downstream: { scopes: oboScopes },
-        },
+        applications: { downstream: { scopes: oboScopes } },
       };
 
       const result = await getOboToken(auth, pluginOptions, {
@@ -225,16 +208,13 @@ describe("OBO integration — real Entra ID token exchange", () => {
         },
         plugins: [
           oboPlugin({
-            applications: {
-              downstream: { scopes: oboScopes },
-            },
+            applications: { downstream: { scopes: oboScopes } },
           }),
         ],
       });
       const { user } = await signInWithTestUser();
       const ctx = await auth.$context;
 
-      // Seed a microsoft account with a deliberately invalid access token
       await ctx.internalAdapter.createAccount({
         userId: user.id,
         providerId: "microsoft",
@@ -243,9 +223,8 @@ describe("OBO integration — real Entra ID token exchange", () => {
         accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
       });
 
-      const result = await ctx.obo.getOboToken({
-        userId: user.id,
-        applicationName: "downstream",
+      const result = await auth.api.getOboToken({
+        body: { userId: user.id, applicationName: "downstream" },
       });
 
       expect(result.success).toBe(false);

@@ -1,5 +1,7 @@
 import { betterFetch, type BetterFetchOption } from "@better-fetch/fetch";
 import type { Account, BetterAuthPlugin, InternalAdapter } from "better-auth";
+import { createAuthEndpoint } from "better-auth/api";
+import { z } from "zod";
 
 /**
  * Minimal structural type for a Better Auth instance.
@@ -98,7 +100,7 @@ type OboPluginOptions<TApplications extends ApplicationsConfig = ApplicationsCon
 };
 
 /**
- * Parameters for `getOboToken`.
+ * Parameters for the standalone `getOboToken` helper.
  *
  * Generic over `TApplications` so `applicationName` is narrowed to the exact
  * keys of the `applications` object passed to `oboPlugin`.
@@ -121,7 +123,7 @@ export type GetOboTokenParams<TApplications extends ApplicationsConfig = Applica
  *
  * @example
  * ```ts
- * const result = await ctx.obo.getOboToken({ userId, applicationName: "graph" });
+ * const result = await auth.api.getOboToken({ body: { userId, applicationName: "graph" } });
  * if (result.success) {
  *   result.data.accessToken  // string | null | undefined
  * } else {
@@ -155,8 +157,8 @@ export type MicrosoftOBOError = {
 
 /**
  * Fully resolved credentials — all fields required.
- * Built at plugin init time by merging `defaultConfig` over the social
- * provider config, then reused for every `getOboToken` call.
+ * Built once per plugin instance (lazily on first endpoint call) by merging
+ * `defaultConfig` over the Microsoft social provider config.
  */
 type ResolvedCredentials = {
   authority: string;
@@ -183,8 +185,8 @@ type MicrosoftProviderOptions = {
 };
 
 /**
- * Resolve the OBO credentials at plugin init time by merging `defaultConfig`
- * (explicit overrides) over the Microsoft social provider config (fallback).
+ * Resolve the OBO credentials by merging `defaultConfig` (explicit overrides)
+ * over the Microsoft social provider config (fallback).
  *
  * Emits a console warning if the effective `tenantId` is `"common"` or
  * `"organizations"`, since Microsoft explicitly discourages those for OBO.
@@ -310,8 +312,7 @@ function fetchOboToken(
 /**
  * Internal implementation of the OBO token exchange.
  * Accepts pre-resolved `credentials` and the raw `InternalAdapter` directly
- * so it can be called both from the plugin's `init` hook (which resolved
- * credentials once at startup) and from the standalone helper.
+ * so it can be called from both the plugin endpoint and the standalone helper.
  */
 async function _getOboToken<TApplications extends ApplicationsConfig>(
   adapter: InternalAdapter,
@@ -398,7 +399,7 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
           ...tokenData,
         });
     return { success: true, data: account, error: null };
-  } catch (err) {
+  } catch {
     // Caching failure is non-fatal — return a synthetic Account-shaped object
     // built from the exchange response so the caller still gets a usable token.
     const synthetic: Account = {
@@ -426,10 +427,10 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
  * so you do not need to repeat them. Any field in `defaultConfig` takes
  * precedence over the social provider config.
  *
- * Injects an `obo` helper onto `auth.$context` so you can call
- * `ctx.obo.getOboToken({ userId, applicationName })` directly without passing
- * credentials at the call site. `applicationName` is narrowed to the exact
- * keys of the `applications` object you provide.
+ * Exposes `auth.api.getOboToken({ body: { userId, applicationName } })` —
+ * the idiomatic Better Auth server-side API pattern (same as `auth.api.banUser`,
+ * `auth.api.createOrganization`, etc.). No HTTP request is made; Better Auth
+ * calls the handler directly.
  *
  * @example
  * ```ts
@@ -454,9 +455,10 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
  *   ],
  * });
  *
- * // On your server — applicationName is typed as "graph" | "my-api":
- * const ctx = await auth.$context;
- * const result = await ctx.obo.getOboToken({ userId, applicationName: "graph" });
+ * // On your server — same pattern as auth.api.banUser():
+ * const result = await auth.api.getOboToken({
+ *   body: { userId, applicationName: "graph" },
+ * });
  * if (result.success) {
  *   result.data.accessToken  // string | null | undefined
  * }
@@ -465,48 +467,89 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
 export const oboPlugin = <TApplications extends ApplicationsConfig>(
   options: OboPluginOptions<TApplications>,
 ) => {
+  // Credentials are resolved lazily on first endpoint call so that the
+  // social provider config (from AuthContext) is available at that point.
+  let credentials: ResolvedCredentials | undefined;
+
+  function getCredentials(ctx: {
+    socialProviders: Array<{ id: string; options?: unknown }>;
+  }): ResolvedCredentials {
+    if (credentials) return credentials;
+    const msProvider = ctx.socialProviders.find((p) => p.id === "microsoft");
+    const msProviderOptions = msProvider?.options as MicrosoftProviderOptions | undefined;
+    credentials = resolveCredentials(options.defaultConfig, msProviderOptions);
+    return credentials;
+  }
+
   return {
     id: "obo-plugin",
     options,
 
-    init(ctx) {
-      // Find the Microsoft social provider and extract its options as fallback
-      // credentials. The `options` field on the provider object contains the
-      // raw config passed to `microsoft({ clientId, clientSecret, ... })`.
-      const msProvider = ctx.socialProviders.find((p) => p.id === "microsoft");
-      const msProviderOptions = msProvider?.options as MicrosoftProviderOptions | undefined;
-
-      // Resolve credentials once at init time — throws early if anything is
-      // missing so misconfiguration is caught at startup, not at request time.
-      const credentials = resolveCredentials(options.defaultConfig, msProviderOptions);
-
-      return {
-        context: {
-          obo: {
-            /**
-             * Get an OBO token for the given user and downstream application.
-             *
-             * Credentials are already resolved — only `userId` and
-             * `applicationName` (narrowed to the keys of `options.applications`)
-             * are required.
-             *
-             * Returns an `OboResult` discriminated union. Check `result.success`
-             * to narrow between the success (`result.data: Account`) and failure
-             * (`result.error: string`) branches.
-             */
-            getOboToken(
-              params: GetOboTokenParams<TApplications>,
-            ): Promise<OboResult> {
-              return _getOboToken(
-                ctx.internalAdapter,
-                credentials,
-                options,
-                params,
-              );
+    endpoints: {
+      /**
+       * Get an OBO (On-Behalf-Of) token for the given user and downstream application.
+       *
+       * Called server-side via `auth.api.getOboToken({ body: { userId, applicationName } })`.
+       * Better Auth invokes the handler directly without an HTTP request.
+       *
+       * Returns an `OboResult` discriminated union — check `result.success` to narrow
+       * between the success (`result.data: Account`) and failure (`result.error: string`)
+       * branches.
+       */
+      getOboToken: createAuthEndpoint(
+        "/obo/get-token",
+        {
+          method: "POST",
+          body: z.object({
+            userId:          z.string(),
+            applicationName: z.string(),
+          }),
+          metadata: {
+            openapi: {
+              operationId: "getOboToken",
+              summary: "Get an On-Behalf-Of token for a downstream application",
+              description:
+                "Exchanges the user's stored Microsoft access token for an OBO token " +
+                "scoped to a named downstream application. Tokens are cached in the " +
+                "account table and reused until within 60 seconds of expiry.",
+              responses: {
+                200: {
+                  description: "OBO token result",
+                  content: {
+                    "application/json": {
+                      schema: {
+                        type: "object",
+                        properties: {
+                          success: { type: "boolean" },
+                          data: { type: "object", nullable: true },
+                          error: { type: "string", nullable: true },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
             },
           },
         },
-      };
+        async (ctx) => {
+          let resolvedCredentials: ResolvedCredentials;
+          try {
+            resolvedCredentials = getCredentials(ctx.context);
+          } catch (err) {
+            return { success: false, data: null, error: (err as Error).message } satisfies OboResult;
+          }
+          return _getOboToken(
+            ctx.context.internalAdapter,
+            resolvedCredentials,
+            options,
+            {
+              userId: ctx.body.userId,
+              applicationName: ctx.body.applicationName,
+            },
+          );
+        },
+      ),
     },
   } satisfies BetterAuthPlugin;
 };
@@ -519,10 +562,10 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
  * Get an OBO (On-Behalf-Of) token for the given user and downstream application.
  *
  * This is the standalone form of the helper — useful when you want to pass
- * credentials explicitly or when you are not using `oboPlugin`. If you have
- * registered `oboPlugin`, prefer `(await auth.$context).obo.getOboToken`
- * instead, which has credentials and options already bound and narrows
- * `applicationName` to the exact keys of your `applications` config.
+ * credentials explicitly, pass a custom `fetchOptions` (e.g. in tests), or
+ * avoid `auth.api` entirely. If you have registered `oboPlugin`, prefer
+ * `auth.api.getOboToken({ body: { ... } })` instead — it is the idiomatic
+ * Better Auth server-side call pattern.
  *
  * When called standalone, `pluginOptions.defaultConfig` must contain all
  * required credential fields (`clientId`, `clientSecret`, and `authority` or
@@ -544,16 +587,16 @@ export async function getOboToken(
   pluginOptions: OboPluginOptions,
   params: GetOboTokenParams,
 ): Promise<OboResult> {
-  let credentials: ResolvedCredentials;
+  let resolvedCredentials: ResolvedCredentials;
   try {
     // No social provider context available here — defaultConfig must be complete.
-    credentials = resolveCredentials(pluginOptions.defaultConfig, undefined);
+    resolvedCredentials = resolveCredentials(pluginOptions.defaultConfig, undefined);
   } catch (err) {
     return { success: false, data: null, error: (err as Error).message };
   }
   const ctx = await auth.$context;
-  return _getOboToken(ctx.internalAdapter, credentials, pluginOptions, params);
+  return _getOboToken(ctx.internalAdapter, resolvedCredentials, pluginOptions, params);
 }
 
-// Re-export so callers can annotate options
+// Re-export types so callers can type-narrow responses and annotate options
 export type { OboPluginOptions };
