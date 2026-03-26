@@ -30,8 +30,8 @@ const PLUGIN_OPTIONS = {
     clientSecret: "test-client-secret",
   },
   applications: {
-    graph: { scopes: ["https://graph.microsoft.com/.default"] },
-    "my-api": { scopes: ["api://my-api/.default"] },
+    graph: { scope: ["https://graph.microsoft.com/.default"] },
+    "my-api": { scope: ["api://my-api/.default"] },
   },
 } satisfies OboPluginOptions;
 
@@ -62,22 +62,24 @@ async function buildAuth() {
  * toAuthEndpoints wrapper which calls betterFetch → globalThis.fetch internally.
  */
 function stubFetch(overrides?: Partial<typeof MOCK_OBO_RESPONSE>) {
-  const mockFn = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) =>
-    new Response(JSON.stringify({ ...MOCK_OBO_RESPONSE, ...overrides }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    }),
+  const mockFn = vi.fn(
+    async (_url: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({ ...MOCK_OBO_RESPONSE, ...overrides }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
   );
   vi.stubGlobal("fetch", mockFn);
   return mockFn;
 }
 
 function stubFetchError(body: object, status = 400) {
-  const mockFn = vi.fn(async () =>
-    new Response(JSON.stringify(body), {
-      status,
-      headers: { "Content-Type": "application/json" },
-    }),
+  const mockFn = vi.fn(
+    async () =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+      }),
   );
   vi.stubGlobal("fetch", mockFn);
   return mockFn;
@@ -124,7 +126,7 @@ describe("oboPlugin", () => {
 
 describe("exported types", () => {
   it("GetOboTokenParams can be used to annotate params objects", () => {
-    const params: GetOboTokenParams<typeof PLUGIN_OPTIONS["applications"]> = {
+    const params: GetOboTokenParams<(typeof PLUGIN_OPTIONS)["applications"]> = {
       userId: "user-123",
       applicationName: "graph", // typed as "graph" | "my-api"
     };
@@ -167,7 +169,7 @@ describe("auth.api.getOboToken — config resolution", () => {
         clientSecret: "test-client-secret",
       },
       applications: {
-        graph: { scopes: ["https://graph.microsoft.com/.default"] },
+        graph: { scope: ["https://graph.microsoft.com/.default"] },
       },
     } satisfies OboPluginOptions;
 
@@ -179,13 +181,16 @@ describe("auth.api.getOboToken — config resolution", () => {
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     let capturedUrl: string | undefined;
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
-      capturedUrl = url.toString();
-      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request) => {
+        capturedUrl = url.toString();
+        return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
 
     await auth.api.getOboToken({
       body: { userId: user.id, applicationName: "graph" },
@@ -203,25 +208,37 @@ describe("auth.api.getOboToken — config resolution", () => {
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     const bodies: URLSearchParams[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      bodies.push(init?.body as URLSearchParams);
-      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        bodies.push(init?.body as URLSearchParams);
+        return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
 
-    await auth.api.getOboToken({ body: { userId: user.id, applicationName: "graph" } });
+    await auth.api.getOboToken({
+      body: { userId: user.id, applicationName: "graph" },
+    });
     // Expire the graph cache so the my-api call also hits the token endpoint
-    const cachedGraph = await ctx.internalAdapter.findAccountByProviderId(user.id, "obo-graph");
+    const cachedGraph = await ctx.internalAdapter.findAccountByProviderId(
+      user.id,
+      "obo-graph",
+    );
     await ctx.internalAdapter.updateAccount(cachedGraph!.id, {
       accessTokenExpiresAt: new Date(Date.now() - 1_000),
     });
-    await auth.api.getOboToken({ body: { userId: user.id, applicationName: "my-api" } });
+    await auth.api.getOboToken({
+      body: { userId: user.id, applicationName: "my-api" },
+    });
 
     expect(bodies[0]?.get("client_id")).toBe("test-client-id");
     expect(bodies[1]?.get("client_id")).toBe("test-client-id");
-    expect(bodies[0]?.get("scope")).toBe("https://graph.microsoft.com/.default");
+    expect(bodies[0]?.get("scope")).toBe(
+      "https://graph.microsoft.com/.default",
+    );
     expect(bodies[1]?.get("scope")).toBe("api://my-api/.default");
   });
 });
@@ -277,14 +294,17 @@ describe("auth.api.getOboToken — successful token exchange", () => {
 
     let capturedUrl: string | undefined;
     let capturedBody: URLSearchParams | undefined;
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      capturedUrl = url.toString();
-      capturedBody = init?.body as URLSearchParams;
-      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        capturedUrl = url.toString();
+        capturedBody = init?.body as URLSearchParams;
+        return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
 
     const result = await auth.api.getOboToken({
       body: { userId: user.id, applicationName: "graph" },
@@ -301,7 +321,9 @@ describe("auth.api.getOboToken — successful token exchange", () => {
     expect(capturedBody?.get("requested_token_use")).toBe("on_behalf_of");
     expect(capturedBody?.get("client_id")).toBe("test-client-id");
     expect(capturedBody?.get("client_secret")).toBe("test-client-secret");
-    expect(capturedBody?.get("scope")).toBe("https://graph.microsoft.com/.default");
+    expect(capturedBody?.get("scope")).toBe(
+      "https://graph.microsoft.com/.default",
+    );
   });
 
   it("returns an Account-shaped data object on success", async () => {
@@ -350,7 +372,8 @@ describe("auth.api.getOboToken — successful token exchange", () => {
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
     stubFetchError({
       error: "invalid_grant",
-      error_description: "AADSTS70011: The provided value for 'scope' is not valid.",
+      error_description:
+        "AADSTS70011: The provided value for 'scope' is not valid.",
     });
 
     const result = await auth.api.getOboToken({
@@ -374,7 +397,9 @@ describe("auth.api.getOboToken — token caching", () => {
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
     stubFetch();
 
-    await auth.api.getOboToken({ body: { userId: user.id, applicationName: "graph" } });
+    await auth.api.getOboToken({
+      body: { userId: user.id, applicationName: "graph" },
+    });
 
     const cachedAccount = await ctx.internalAdapter.findAccountByProviderId(
       user.id,
@@ -393,7 +418,9 @@ describe("auth.api.getOboToken — token caching", () => {
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
     const mockFetch = stubFetch();
 
-    await auth.api.getOboToken({ body: { userId: user.id, applicationName: "graph" } });
+    await auth.api.getOboToken({
+      body: { userId: user.id, applicationName: "graph" },
+    });
     expect(mockFetch).toHaveBeenCalledTimes(1);
 
     const result = await auth.api.getOboToken({
@@ -421,7 +448,9 @@ describe("auth.api.getOboToken — token caching", () => {
       accessTokenExpiresAt: new Date(Date.now() - 1_000),
     });
 
-    const mockFetch = stubFetch({ access_token: "fresh-obo-token-after-expiry" });
+    const mockFetch = stubFetch({
+      access_token: "fresh-obo-token-after-expiry",
+    });
 
     const result = await auth.api.getOboToken({
       body: { userId: user.id, applicationName: "graph" },
@@ -473,7 +502,7 @@ describe("standalone getOboToken helper", () => {
         clientSecret: "test-client-secret",
       },
       applications: {
-        graph: { scopes: ["https://graph.microsoft.com/.default"] },
+        graph: { scope: ["https://graph.microsoft.com/.default"] },
       },
     };
     const { auth } = await buildAuth();
@@ -491,11 +520,12 @@ describe("standalone getOboToken helper", () => {
     const ctx = await auth.$context;
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+    const mockFetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
     );
 
     const result = await getOboToken(auth, PLUGIN_OPTIONS, {
@@ -517,11 +547,12 @@ describe("standalone getOboToken helper", () => {
     await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     // First call via standalone helper — populates the cache
-    const standaloneMock = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
+    const standaloneMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
     );
     await getOboToken(auth, PLUGIN_OPTIONS, {
       userId: user.id,
@@ -555,7 +586,7 @@ describe("credential fallback from Microsoft social provider", () => {
       plugins: [
         oboPlugin({
           applications: {
-            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+            graph: { scope: ["https://graph.microsoft.com/.default"] },
           },
         }),
       ],
@@ -566,14 +597,17 @@ describe("credential fallback from Microsoft social provider", () => {
 
     let capturedUrl: string | undefined;
     let capturedBody: URLSearchParams | undefined;
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      capturedUrl = url.toString();
-      capturedBody = init?.body as URLSearchParams;
-      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        capturedUrl = url.toString();
+        capturedBody = init?.body as URLSearchParams;
+        return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
 
     const result = await auth.api.getOboToken({
       body: { userId: user.id, applicationName: "graph" },
@@ -592,7 +626,7 @@ describe("credential fallback from Microsoft social provider", () => {
         oboPlugin({
           defaultConfig: { tenantId: "override-tenant-id" },
           applications: {
-            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+            graph: { scope: ["https://graph.microsoft.com/.default"] },
           },
         }),
       ],
@@ -603,16 +637,21 @@ describe("credential fallback from Microsoft social provider", () => {
 
     let capturedUrl: string | undefined;
     let capturedBody: URLSearchParams | undefined;
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-      capturedUrl = url.toString();
-      capturedBody = init?.body as URLSearchParams;
-      return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
-    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        capturedUrl = url.toString();
+        capturedBody = init?.body as URLSearchParams;
+        return new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
 
-    await auth.api.getOboToken({ body: { userId: user.id, applicationName: "graph" } });
+    await auth.api.getOboToken({
+      body: { userId: user.id, applicationName: "graph" },
+    });
 
     expect(capturedUrl).toContain("override-tenant-id");
     expect(capturedUrl).not.toContain("ms-social-tenant-id");
@@ -634,14 +673,16 @@ describe("credential fallback from Microsoft social provider", () => {
       plugins: [
         oboPlugin({
           applications: {
-            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+            graph: { scope: ["https://graph.microsoft.com/.default"] },
           },
         }),
       ],
     });
     // Trigger credential resolution via the endpoint
     const { user } = await signInWithTestUser();
-    await auth.api.getOboToken({ body: { userId: user.id, applicationName: "graph" } });
+    await auth.api.getOboToken({
+      body: { userId: user.id, applicationName: "graph" },
+    });
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("common"));
     warnSpy.mockRestore();
@@ -652,7 +693,7 @@ describe("credential fallback from Microsoft social provider", () => {
       plugins: [
         oboPlugin({
           applications: {
-            graph: { scopes: ["https://graph.microsoft.com/.default"] },
+            graph: { scope: ["https://graph.microsoft.com/.default"] },
           },
         }),
       ],

@@ -48,9 +48,9 @@ export const auth = betterAuth({
   plugins: [
     oboPlugin({
       applications: {
-        // Each key is a name you choose; scopes are the downstream API's scopes.
-        graph:    { scopes: ["https://graph.microsoft.com/.default"] },
-        "my-api": { scopes: ["api://my-downstream-app-id/.default"] },
+        // Each key is a name you choose; scope are the downstream API's scope.
+        graph:    { scope: ["https://graph.microsoft.com/.default"] },
+        "my-api": { scope: ["api://my-downstream-app-id/.default"] },
       },
     }),
   ],
@@ -101,7 +101,7 @@ const pluginOptions = {
     tenantId:     process.env.AZURE_TENANT_ID!,
   },
   applications: {
-    "my-api": { scopes: ["api://my-downstream-app-id/.default"] },
+    "my-api": { scope: ["api://my-downstream-app-id/.default"] },
   },
 };
 
@@ -119,7 +119,7 @@ if (result.success) {
 
 | Option | Type | Required | Description |
 |---|---|---|---|
-| `applications` | `Record<string, { scopes: string[], id?: string }>` | Yes | Named downstream applications. Each key becomes a valid `applicationName`. `scopes` are the downstream API scopes to request. |
+| `applications` | `Record<string, { scope: string[], id?: string }>` | Yes | Named downstream applications. Each key becomes a valid `applicationName`. `scope` are the downstream API scope to request. |
 | `defaultConfig` | `OboDefaultConfig` | No | Credential overrides. Any field omitted here is read from the Microsoft social provider config. The entire object may be omitted when the social provider already has a specific `tenantId`. |
 | `defaultConfig.clientId` | `string` | No* | Middle-tier app client ID. Falls back to `socialProviders.microsoft.clientId`. |
 | `defaultConfig.clientSecret` | `string` | No* | Middle-tier app client secret. Falls back to `socialProviders.microsoft.clientSecret`. |
@@ -151,8 +151,8 @@ On success (`result.success === true`), `result.data` is a Better Auth `Account`
 | Field | Type | Description |
 |---|---|---|
 | `accessToken` | `string \| null \| undefined` | The OBO access token for the downstream API. |
-| `refreshToken` | `string \| null \| undefined` | Present when `offline_access` is in the requested scopes. |
-| `scope` | `string \| null \| undefined` | Space-separated scopes granted by Entra ID. |
+| `refreshToken` | `string \| null \| undefined` | Present when `offline_access` is in the requested scope. |
+| `scope` | `string \| null \| undefined` | Space-separated scope granted by Entra ID. |
 | `accessTokenExpiresAt` | `Date \| null \| undefined` | When the token expires. |
 | `providerId` | `string` | Always `"obo-<applicationName>"`. |
 | `userId` | `string` | The Better Auth user ID. |
@@ -179,7 +179,7 @@ OBO tokens are cached automatically in Better Auth's existing `account` table us
 For OBO to work, your middle-tier app registration in Entra ID must:
 
 1. **Expose an API** — define at least one scope (e.g. `access-as`) under **Expose an API** in the app registration. The client app requests this scope when signing in, which makes your app the `aud` of the incoming token.
-2. **Grant API permissions** — add delegated permissions for each downstream API your server needs to call (e.g. `User.Read` for Microsoft Graph, or custom scopes for your own APIs).
+2. **Grant API permissions** — add delegated permissions for each downstream API your server needs to call (e.g. `User.Read` for Microsoft Graph, or custom scope for your own APIs).
 3. **Have admin consent** (or user consent) for those downstream permissions — this is what allows the OBO exchange to succeed without additional user interaction.
 
 > See [Gaining consent for the middle-tier application](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-on-behalf-of-flow#gaining-consent-for-the-middle-tier-application) for details on the consent model.
@@ -204,7 +204,7 @@ Integration tests make real HTTP requests to the Microsoft Entra ID token endpoi
 VITE_ENTRA_CLIENT_ID=<your-middle-tier-app-client-id>
 VITE_ENTRA_CLIENT_SECRET=<your-client-secret>
 VITE_ENTRA_TENANT_ID=<your-tenant-id>
-VITE_ENTRA_OBO_SCOPES=api://<downstream-app-id>/.default,offline_access
+VITE_ENTRA_OBO_scope=api://<downstream-app-id>/.default,offline_access
 VITE_ENTRA_ACCESS_TOKEN=<a-valid-delegated-access-token>
 ```
 
@@ -213,7 +213,7 @@ VITE_ENTRA_ACCESS_TOKEN=<a-valid-delegated-access-token>
 | `VITE_ENTRA_CLIENT_ID` | Client ID of the middle-tier app registration. |
 | `VITE_ENTRA_CLIENT_SECRET` | Client secret of the middle-tier app registration. |
 | `VITE_ENTRA_TENANT_ID` | Your Azure AD tenant ID (a specific GUID, not `"common"`). |
-| `VITE_ENTRA_OBO_SCOPES` | Comma-separated scopes for the downstream application. |
+| `VITE_ENTRA_OBO_scope` | Comma-separated scope for the downstream application. |
 | `VITE_ENTRA_ACCESS_TOKEN` | A valid delegated access token issued to `VITE_ENTRA_CLIENT_ID`. The `aud` claim must match the client ID. Obtain one via [MSAL](https://learn.microsoft.com/entra/msal/overview), [Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer), or Postman. |
 
 ```bash

@@ -8,7 +8,7 @@
  *   VITE_ENTRA_CLIENT_ID      – middle-tier app client ID
  *   VITE_ENTRA_CLIENT_SECRET  – middle-tier app client secret
  *   VITE_ENTRA_TENANT_ID      – Azure AD tenant ID (must be specific, not "common")
- *   VITE_ENTRA_OBO_SCOPES     – comma-separated downstream scopes
+ *   VITE_ENTRA_OBO_SCOPE     – comma-separated downstream scope
  *   VITE_ENTRA_ACCESS_TOKEN   – a valid delegated access token issued to VITE_ENTRA_CLIENT_ID
  *
  * All tests are skipped when any of the above variables are absent so that CI
@@ -27,10 +27,10 @@ const hasCredentials =
   !!process.env.VITE_ENTRA_CLIENT_ID &&
   !!process.env.VITE_ENTRA_CLIENT_SECRET &&
   !!process.env.VITE_ENTRA_TENANT_ID &&
-  !!process.env.VITE_ENTRA_OBO_SCOPES &&
+  !!process.env.VITE_ENTRA_OBO_SCOPE &&
   !!process.env.VITE_ENTRA_ACCESS_TOKEN;
 
-const oboScopes = (process.env.VITE_ENTRA_OBO_SCOPES ?? "")
+const oboscope = (process.env.VITE_ENTRA_OBO_SCOPE ?? "")
   .split(",")
   .filter(Boolean);
 
@@ -49,7 +49,7 @@ async function buildIntegrationAuth() {
     },
     plugins: [
       oboPlugin({
-        applications: { downstream: { scopes: oboScopes } },
+        applications: { downstream: { scope: oboscope } },
       }),
     ],
   });
@@ -90,10 +90,12 @@ describe("OBO integration — real Entra ID token exchange", () => {
       expect(result.data.providerId).toBe("obo-downstream");
       expect(result.data.userId).toBe(user.id);
       expect(result.data.accessTokenExpiresAt).toBeInstanceOf(Date);
-      expect(result.data.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
-      const returnedScopes = (result.data.scope ?? "").split(" ");
-      const requestedScopes = oboScopes.flatMap((s) => s.split(" "));
-      expect(returnedScopes.some((s) => requestedScopes.includes(s))).toBe(true);
+      expect(result.data.accessTokenExpiresAt!.getTime()).toBeGreaterThan(
+        Date.now(),
+      );
+      const returnedscope = (result.data.scope ?? "").split(" ");
+      const requestedscope = oboscope.flatMap((s) => s.split(" "));
+      expect(returnedscope.some((s) => requestedscope.includes(s))).toBe(true);
       expect(result.error).toBeNull();
     },
     30_000,
@@ -117,7 +119,9 @@ describe("OBO integration — real Entra ID token exchange", () => {
       expect(typeof cached?.accessToken).toBe("string");
       expect(cached!.accessToken!.length).toBeGreaterThan(0);
       expect(cached?.accessTokenExpiresAt).toBeInstanceOf(Date);
-      expect(cached!.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+      expect(cached!.accessTokenExpiresAt!.getTime()).toBeGreaterThan(
+        Date.now(),
+      );
     },
     30_000,
   );
@@ -156,7 +160,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
               clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
               tenantId: process.env.VITE_ENTRA_TENANT_ID!,
             },
-            applications: { downstream: { scopes: oboScopes } },
+            applications: { downstream: { scope: oboscope } },
           }),
         ],
       });
@@ -177,7 +181,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
           clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
           tenantId: process.env.VITE_ENTRA_TENANT_ID!,
         },
-        applications: { downstream: { scopes: oboScopes } },
+        applications: { downstream: { scope: oboscope } },
       };
 
       const result = await getOboToken(auth, pluginOptions, {
@@ -208,7 +212,7 @@ describe("OBO integration — real Entra ID token exchange", () => {
         },
         plugins: [
           oboPlugin({
-            applications: { downstream: { scopes: oboScopes } },
+            applications: { downstream: { scope: oboscope } },
           }),
         ],
       });

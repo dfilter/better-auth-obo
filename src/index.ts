@@ -61,16 +61,16 @@ type OboDefaultConfig = {
  * Per-downstream-application config.
  *
  * The only thing that varies between downstream applications is the set of
- * scopes you want the OBO token to carry.
+ * scope you want the OBO token to carry.
  */
 type ApplicationConfig = {
   /** An optional stable identifier for this application entry. */
   id?: string;
   /**
-   * Downstream API scopes to request, e.g.
+   * Downstream API scope to request, e.g.
    * `["https://graph.microsoft.com/.default"]`.
    */
-  scopes: string[];
+  scope: string[];
 };
 
 type ApplicationsConfig = {
@@ -83,7 +83,9 @@ type ApplicationsConfig = {
  * Generic over `TApplications` so that `applicationName` in `GetOboTokenParams`
  * is narrowed to the exact keys of the `applications` object you provide.
  */
-type OboPluginOptions<TApplications extends ApplicationsConfig = ApplicationsConfig> = {
+type OboPluginOptions<
+  TApplications extends ApplicationsConfig = ApplicationsConfig,
+> = {
   /**
    * Middle-tier application credentials and token endpoint overrides.
    * Any field omitted here is read from the Microsoft social provider config.
@@ -105,7 +107,9 @@ type OboPluginOptions<TApplications extends ApplicationsConfig = ApplicationsCon
  * Generic over `TApplications` so `applicationName` is narrowed to the exact
  * keys of the `applications` object passed to `oboPlugin`.
  */
-export type GetOboTokenParams<TApplications extends ApplicationsConfig = ApplicationsConfig> = {
+export type GetOboTokenParams<
+  TApplications extends ApplicationsConfig = ApplicationsConfig,
+> = {
   /** The Better Auth user ID to act on behalf of. */
   userId: string;
   /** A key from the `applications` config passed to `oboPlugin`. */
@@ -132,8 +136,8 @@ export type GetOboTokenParams<TApplications extends ApplicationsConfig = Applica
  * ```
  */
 export type OboResult =
-  | { success: true;  data: Account; error: null   }
-  | { success: false; data: null;    error: string };
+  | { success: true; data: Account; error: null }
+  | { success: false; data: null; error: string };
 
 /** Raw response from the Microsoft token endpoint — internal only. */
 type MicrosoftOBOToken = {
@@ -166,7 +170,7 @@ type ResolvedCredentials = {
   clientSecret: string;
 };
 
-/** Fully resolved per-call config — credentials + application scopes. */
+/** Fully resolved per-call config — credentials + application scope. */
 type ResolvedConfig = ResolvedCredentials & ApplicationConfig;
 
 // ---------------------------------------------------------------------------
@@ -198,14 +202,16 @@ function resolveCredentials(
   msProviderOptions: MicrosoftProviderOptions | undefined,
 ): ResolvedCredentials {
   const clientId = defaultConfig?.clientId ?? msProviderOptions?.clientId;
-  const clientSecret = defaultConfig?.clientSecret ?? msProviderOptions?.clientSecret;
+  const clientSecret =
+    defaultConfig?.clientSecret ?? msProviderOptions?.clientSecret;
 
   // Authority resolution:
   //   1. explicit authority in defaultConfig
   //   2. explicit tenantId in defaultConfig → derive URL
   //   3. social provider authority + social provider tenantId → combine
   //   4. social provider tenantId alone → derive URL
-  const effectiveTenantId = defaultConfig?.tenantId ?? msProviderOptions?.tenantId;
+  const effectiveTenantId =
+    defaultConfig?.tenantId ?? msProviderOptions?.tenantId;
   const baseAuthority =
     defaultConfig?.authority ??
     (defaultConfig?.tenantId
@@ -264,9 +270,9 @@ function resolveConfig(
         `Available applications: ${Object.keys(pluginOptions.applications).join(", ")}`,
     );
   }
-  if (!appConfig.scopes?.length) {
+  if (!appConfig.scope?.length) {
     throw new Error(
-      `[obo-plugin] Missing required scopes for application "${applicationName}".`,
+      `[obo-plugin] Missing required scope for application "${applicationName}".`,
     );
   }
   return { ...credentials, ...appConfig };
@@ -295,7 +301,7 @@ function fetchOboToken(
     grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
     assertion,
     requested_token_use: "on_behalf_of",
-    scope: config.scopes.join(" "),
+    scope: config.scope.join(" "),
   });
   return betterFetch<MicrosoftOBOToken>(url, {
     ...fetchOptions,
@@ -333,7 +339,10 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
   const providerId = oboProviderId(applicationName);
 
   // 2. Check the OBO token cache (synthetic account row)
-  const cachedAccount = await adapter.findAccountByProviderId(userId, providerId);
+  const cachedAccount = await adapter.findAccountByProviderId(
+    userId,
+    providerId,
+  );
   const now = Date.now();
   const bufferMs = 60_000; // 60-second expiry buffer
 
@@ -448,8 +457,8 @@ async function _getOboToken<TApplications extends ApplicationsConfig>(
  *   plugins: [
  *     oboPlugin({
  *       applications: {
- *         graph:    { scopes: ["https://graph.microsoft.com/.default"] },
- *         "my-api": { scopes: ["api://my-api/.default"] },
+ *         graph:    { scope: ["https://graph.microsoft.com/.default"] },
+ *         "my-api": { scope: ["api://my-api/.default"] },
  *       },
  *     }),
  *   ],
@@ -476,7 +485,9 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
   }): ResolvedCredentials {
     if (credentials) return credentials;
     const msProvider = ctx.socialProviders.find((p) => p.id === "microsoft");
-    const msProviderOptions = msProvider?.options as MicrosoftProviderOptions | undefined;
+    const msProviderOptions = msProvider?.options as
+      | MicrosoftProviderOptions
+      | undefined;
     credentials = resolveCredentials(options.defaultConfig, msProviderOptions);
     return credentials;
   }
@@ -501,7 +512,7 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
         {
           method: "POST",
           body: z.object({
-            userId:          z.string(),
+            userId: z.string(),
             applicationName: z.string(),
           }),
           metadata: {
@@ -537,7 +548,11 @@ export const oboPlugin = <TApplications extends ApplicationsConfig>(
           try {
             resolvedCredentials = getCredentials(ctx.context);
           } catch (err) {
-            return { success: false, data: null, error: (err as Error).message } satisfies OboResult;
+            return {
+              success: false,
+              data: null,
+              error: (err as Error).message,
+            } satisfies OboResult;
           }
           return _getOboToken(
             ctx.context.internalAdapter,
@@ -590,12 +605,20 @@ export async function getOboToken(
   let resolvedCredentials: ResolvedCredentials;
   try {
     // No social provider context available here — defaultConfig must be complete.
-    resolvedCredentials = resolveCredentials(pluginOptions.defaultConfig, undefined);
+    resolvedCredentials = resolveCredentials(
+      pluginOptions.defaultConfig,
+      undefined,
+    );
   } catch (err) {
     return { success: false, data: null, error: (err as Error).message };
   }
   const ctx = await auth.$context;
-  return _getOboToken(ctx.internalAdapter, resolvedCredentials, pluginOptions, params);
+  return _getOboToken(
+    ctx.internalAdapter,
+    resolvedCredentials,
+    pluginOptions,
+    params,
+  );
 }
 
 // Re-export types so callers can type-narrow responses and annotate options
