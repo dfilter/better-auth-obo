@@ -1,7 +1,7 @@
 {
   "name": "better-auth-obo",
   "type": "module",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "A starter for creating a TypeScript package.",
   "author": "Dirk Filter <dirk_filter@outlook.com>",
   "license": "MIT",
