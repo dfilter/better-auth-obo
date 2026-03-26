@@ -67,31 +67,34 @@ export const auth = betterAuth({
 
 The plugin injects an `obo` helper onto `auth.$context` at startup with credentials already bound. This is the cleanest call site — no credentials or options needed at the point of use.
 
+`applicationName` is statically typed to the exact keys of the `applications` object you passed to `oboPlugin`, so typos are caught at compile time.
+
 ```ts
 import { auth } from "./auth";
 
 const ctx = await auth.$context;
 
-const { data, error } = await ctx.obo.exchangeToken(userId, "graph");
+// applicationName is typed as "graph" | "my-api" — typos are a compile error
+const result = await ctx.obo.getOboToken({ userId, applicationName: "graph" });
 
-if (error) {
-  // error is a string describing what went wrong
-  console.error(error);
+if (!result.success) {
+  console.error(result.error); // string
   return;
 }
 
-// data.access_token is ready to forward to the downstream API
+// result.data is a Better Auth Account object
+// result.data.accessToken holds the OBO access token
 await fetch("https://graph.microsoft.com/v1.0/me", {
-  headers: { Authorization: `Bearer ${data.access_token}` },
+  headers: { Authorization: `Bearer ${result.data.accessToken}` },
 });
 ```
 
 ### Via the standalone helper
 
-If you need to pass credentials explicitly — for example when writing tests or in a context where the plugin is not registered — use the exported `exchangeOboToken` function directly. When using this form, `defaultConfig` must contain all required credential fields since there is no social provider context to fall back to.
+If you need to pass credentials explicitly — for example when writing tests or in a context where the plugin is not registered — use the exported `getOboToken` function directly. When using this form, `defaultConfig` must contain all required credential fields since there is no social provider context to fall back to.
 
 ```ts
-import { exchangeOboToken } from "better-auth-obo";
+import { getOboToken } from "better-auth-obo";
 import { auth } from "./auth";
 
 const pluginOptions = {
@@ -105,7 +108,10 @@ const pluginOptions = {
   },
 };
 
-const { data, error } = await exchangeOboToken(auth, pluginOptions, userId, "my-api");
+const result = await getOboToken(auth, pluginOptions, { userId, applicationName: "my-api" });
+if (result.success) {
+  console.log(result.data.accessToken);
+}
 ```
 
 ---
@@ -116,7 +122,7 @@ const { data, error } = await exchangeOboToken(auth, pluginOptions, userId, "my-
 
 | Option | Type | Required | Description |
 |---|---|---|---|
-| `applications` | `Record<string, { scopes: string[], id?: string }>` | Yes | Named downstream applications. Each key is passed as `applicationName` to `exchangeToken`. `scopes` are the downstream API scopes to request. |
+| `applications` | `Record<string, { scopes: string[], id?: string }>` | Yes | Named downstream applications. Each key becomes a valid `applicationName`. `scopes` are the downstream API scopes to request. |
 | `defaultConfig` | `OboDefaultConfig` | No | Credential overrides. Any field omitted here is read from the Microsoft social provider config. The entire object may be omitted when the social provider already has a specific `tenantId`. |
 | `defaultConfig.clientId` | `string` | No* | Middle-tier app client ID. Falls back to `socialProviders.microsoft.clientId`. |
 | `defaultConfig.clientSecret` | `string` | No* | Middle-tier app client secret. Falls back to `socialProviders.microsoft.clientSecret`. |
@@ -125,28 +131,36 @@ const { data, error } = await exchangeOboToken(auth, pluginOptions, userId, "my-
 
 \* Required collectively — after merging `defaultConfig` with the social provider config, `clientId`, `clientSecret`, and either `authority` or `tenantId` must all be resolvable. The plugin throws at startup if any are missing.
 
-### `ctx.obo.exchangeToken(userId, applicationName, fetchOptions?)`
+### `ctx.obo.getOboToken(params)`
 
-| Parameter | Type | Description |
-|---|---|---|
-| `userId` | `string` | The Better Auth user ID to exchange on behalf of. The user must have previously signed in via the Microsoft social provider. |
-| `applicationName` | `string` | A key from `options.applications`. |
-| `fetchOptions` | `BetterFetchOption` | Optional. Advanced fetch overrides (custom fetch implementation, timeouts, etc.). |
-
-**Returns:** `Promise<{ data: MicrosoftOBOToken | null, error: string | null }>`
-
-On success, `data` contains:
+Accepts a single `GetOboTokenParams` object:
 
 | Field | Type | Description |
 |---|---|---|
-| `access_token` | `string` | The OBO access token for the downstream API. |
-| `token_type` | `"Bearer"` | Always `"Bearer"`. |
-| `scope` | `string` | Space-separated scopes granted by Entra ID. |
-| `expires_in` | `number` | Seconds until the token expires. |
-| `ext_expires_in` | `number` | Extended expiry window (for resilience). |
-| `refresh_token` | `string \| undefined` | Present when `offline_access` is in the requested scopes. |
+| `userId` | `string` | The Better Auth user ID to act on behalf of. The user must have previously signed in via the Microsoft social provider. |
+| `applicationName` | `keyof applications & string` | A key from `options.applications`. Typed to your exact application names — typos are compile errors. |
+| `fetchOptions` | `BetterFetchOption` | Optional. Advanced fetch overrides (custom fetch implementation, timeouts, etc.). |
 
-On failure, `data` is `null` and `error` is a string describing the problem.
+**Returns:** `Promise<OboResult>` — a discriminated union:
+
+```ts
+type OboResult =
+  | { success: true;  data: Account; error: null   }
+  | { success: false; data: null;    error: string };
+```
+
+On success (`result.success === true`), `result.data` is a Better Auth `Account` object containing the cached OBO token:
+
+| Field | Type | Description |
+|---|---|---|
+| `accessToken` | `string \| null \| undefined` | The OBO access token for the downstream API. |
+| `refreshToken` | `string \| null \| undefined` | Present when `offline_access` is in the requested scopes. |
+| `scope` | `string \| null \| undefined` | Space-separated scopes granted by Entra ID. |
+| `accessTokenExpiresAt` | `Date \| null \| undefined` | When the token expires. |
+| `providerId` | `string` | Always `"obo-<applicationName>"`. |
+| `userId` | `string` | The Better Auth user ID. |
+
+On failure (`result.success === false`), `result.data` is `null` and `result.error` is a string describing the problem.
 
 ---
 

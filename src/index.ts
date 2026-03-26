@@ -1,11 +1,11 @@
 import { betterFetch, type BetterFetchOption } from "@better-fetch/fetch";
-import type { BetterAuthPlugin, InternalAdapter } from "better-auth";
+import type { Account, BetterAuthPlugin, InternalAdapter } from "better-auth";
 
 /**
  * Minimal structural type for a Better Auth instance.
  * Using a structural type instead of the concrete `Auth<Options>` ensures
- * that `exchangeOboToken` is compatible with any `Auth<Options>` regardless
- * of how narrowly TypeScript has inferred the `Options` type parameter.
+ * that `getOboToken` is compatible with any `Auth<Options>` regardless of
+ * how narrowly TypeScript has inferred the `Options` type parameter.
  */
 export type AuthLike = {
   $context: Promise<{ internalAdapter: InternalAdapter }>;
@@ -59,9 +59,7 @@ type OboDefaultConfig = {
  * Per-downstream-application config.
  *
  * The only thing that varies between downstream applications is the set of
- * scopes you want the OBO token to carry. Everything else (`clientId`,
- * `clientSecret`, `authority`) belongs to your middle-tier app and is
- * resolved once from `defaultConfig` or the Microsoft social provider config.
+ * scopes you want the OBO token to carry.
  */
 type ApplicationConfig = {
   /** An optional stable identifier for this application entry. */
@@ -77,8 +75,13 @@ type ApplicationsConfig = {
   [applicationName: string]: ApplicationConfig;
 };
 
-/** Options passed to `oboPlugin()`. */
-type OboPluginOptions = {
+/**
+ * Options passed to `oboPlugin()`.
+ *
+ * Generic over `TApplications` so that `applicationName` in `GetOboTokenParams`
+ * is narrowed to the exact keys of the `applications` object you provide.
+ */
+type OboPluginOptions<TApplications extends ApplicationsConfig = ApplicationsConfig> = {
   /**
    * Middle-tier application credentials and token endpoint overrides.
    * Any field omitted here is read from the Microsoft social provider config.
@@ -89,12 +92,48 @@ type OboPluginOptions = {
   defaultConfig?: OboDefaultConfig;
   /**
    * Named downstream applications to exchange tokens for.
-   * Keys are the `applicationName` strings passed to `exchangeOboToken`.
+   * Keys become the valid values for `applicationName` in `GetOboTokenParams`.
    */
-  applications: ApplicationsConfig;
+  applications: TApplications;
 };
 
-/** Successful response from the Microsoft token endpoint for an OBO exchange. */
+/**
+ * Parameters for `getOboToken`.
+ *
+ * Generic over `TApplications` so `applicationName` is narrowed to the exact
+ * keys of the `applications` object passed to `oboPlugin`.
+ */
+export type GetOboTokenParams<TApplications extends ApplicationsConfig = ApplicationsConfig> = {
+  /** The Better Auth user ID to act on behalf of. */
+  userId: string;
+  /** A key from the `applications` config passed to `oboPlugin`. */
+  applicationName: keyof TApplications & string;
+  /** Optional `@better-fetch/fetch` overrides (e.g. custom fetch impl for tests). */
+  fetchOptions?: BetterFetchOption;
+};
+
+/**
+ * Discriminated union returned by `getOboToken`.
+ *
+ * When `success` is `true`, `data` is the Better Auth `Account` row for the
+ * cached OBO token and `error` is `null`. When `success` is `false`, `data`
+ * is `null` and `error` is a string describing what went wrong.
+ *
+ * @example
+ * ```ts
+ * const result = await ctx.obo.getOboToken({ userId, applicationName: "graph" });
+ * if (result.success) {
+ *   result.data.accessToken  // string | null | undefined
+ * } else {
+ *   console.error(result.error);
+ * }
+ * ```
+ */
+export type OboResult =
+  | { success: true;  data: Account; error: null   }
+  | { success: false; data: null;    error: string };
+
+/** Raw response from the Microsoft token endpoint — internal only. */
 type MicrosoftOBOToken = {
   token_type: "Bearer";
   scope: string;
@@ -105,7 +144,7 @@ type MicrosoftOBOToken = {
 };
 
 /** Error response from the Microsoft token endpoint. */
-type MicrosoftOBOError = {
+export type MicrosoftOBOError = {
   error: string;
   error_description?: string;
   error_codes?: number[];
@@ -117,7 +156,7 @@ type MicrosoftOBOError = {
 /**
  * Fully resolved credentials — all fields required.
  * Built at plugin init time by merging `defaultConfig` over the social
- * provider config, then reused for every `exchangeToken` call.
+ * provider config, then reused for every `getOboToken` call.
  */
 type ResolvedCredentials = {
   authority: string;
@@ -163,7 +202,7 @@ function resolveCredentials(
   //   1. explicit authority in defaultConfig
   //   2. explicit tenantId in defaultConfig → derive URL
   //   3. social provider authority + social provider tenantId → combine
-  //   4. social provider authority alone (may already include tenant path)
+  //   4. social provider tenantId alone → derive URL
   const effectiveTenantId = defaultConfig?.tenantId ?? msProviderOptions?.tenantId;
   const baseAuthority =
     defaultConfig?.authority ??
@@ -274,20 +313,20 @@ function fetchOboToken(
  * so it can be called both from the plugin's `init` hook (which resolved
  * credentials once at startup) and from the standalone helper.
  */
-async function _exchangeOboToken(
+async function _getOboToken<TApplications extends ApplicationsConfig>(
   adapter: InternalAdapter,
   credentials: ResolvedCredentials,
-  pluginOptions: OboPluginOptions,
-  userId: string,
-  applicationName: string,
-  fetchOptions?: BetterFetchOption,
-): Promise<{ data: MicrosoftOBOToken | null; error: string | null }> {
+  pluginOptions: OboPluginOptions<TApplications>,
+  params: GetOboTokenParams<TApplications>,
+): Promise<OboResult> {
+  const { userId, applicationName, fetchOptions } = params;
+
   // 1. Resolve per-application config
   let config: ResolvedConfig;
   try {
     config = resolveConfig(credentials, pluginOptions, applicationName);
   } catch (err) {
-    return { data: null, error: (err as Error).message };
+    return { success: false, data: null, error: (err as Error).message };
   }
 
   const providerId = oboProviderId(applicationName);
@@ -302,24 +341,7 @@ async function _exchangeOboToken(
     cachedAccount.accessTokenExpiresAt &&
     cachedAccount.accessTokenExpiresAt.getTime() - now > bufferMs
   ) {
-    // Valid cached token — reconstruct a MicrosoftOBOToken shape from stored fields
-    return {
-      data: {
-        token_type: "Bearer",
-        access_token: cachedAccount.accessToken,
-        scope: cachedAccount.scope ?? config.scopes.join(" "),
-        expires_in: Math.floor(
-          (cachedAccount.accessTokenExpiresAt.getTime() - now) / 1000,
-        ),
-        ext_expires_in: Math.floor(
-          (cachedAccount.accessTokenExpiresAt.getTime() - now) / 1000,
-        ),
-        ...(cachedAccount.refreshToken
-          ? { refresh_token: cachedAccount.refreshToken }
-          : {}),
-      },
-      error: null,
-    };
+    return { success: true, data: cachedAccount, error: null };
   }
 
   // 3. Look up the user's real Microsoft account to get the assertion token
@@ -328,6 +350,7 @@ async function _exchangeOboToken(
 
   if (!msAccount?.accessToken) {
     return {
+      success: false,
       data: null,
       error:
         `[obo-plugin] No Microsoft access token found for user "${userId}". ` +
@@ -348,12 +371,15 @@ async function _exchangeOboToken(
         ? fetchError.message
         : JSON.stringify(fetchError);
     return {
+      success: false,
       data: null,
       error: `[obo-plugin] OBO token exchange failed: ${detail}`,
     };
   }
 
-  // 5. Upsert the OBO token into the account table for caching
+  // 5. Upsert the OBO token into the account table for caching.
+  //    Both createAccount and updateAccount return the persisted Account row,
+  //    which we return directly as the result data.
   const expiresAt = new Date(now + oboToken.expires_in * 1000);
   const tokenData = {
     accessToken: oboToken.access_token,
@@ -363,21 +389,29 @@ async function _exchangeOboToken(
   };
 
   try {
-    if (cachedAccount) {
-      await adapter.updateAccount(cachedAccount.id, tokenData);
-    } else {
-      await adapter.createAccount({
-        userId,
-        providerId,
-        accountId: userId, // no real "accountId" for an OBO token — use userId
-        ...tokenData,
-      });
-    }
-  } catch {
-    // Caching failure is non-fatal — the token was still obtained successfully
+    const account = cachedAccount
+      ? await adapter.updateAccount(cachedAccount.id, tokenData)
+      : await adapter.createAccount({
+          userId,
+          providerId,
+          accountId: userId, // no real "accountId" for an OBO token — use userId
+          ...tokenData,
+        });
+    return { success: true, data: account, error: null };
+  } catch (err) {
+    // Caching failure is non-fatal — return a synthetic Account-shaped object
+    // built from the exchange response so the caller still gets a usable token.
+    const synthetic: Account = {
+      id: cachedAccount?.id ?? "",
+      createdAt: cachedAccount?.createdAt ?? new Date(now),
+      updatedAt: new Date(now),
+      providerId,
+      accountId: userId,
+      userId,
+      ...tokenData,
+    };
+    return { success: true, data: synthetic, error: null };
   }
-
-  return { data: oboToken, error: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -393,8 +427,9 @@ async function _exchangeOboToken(
  * precedence over the social provider config.
  *
  * Injects an `obo` helper onto `auth.$context` so you can call
- * `ctx.obo.exchangeToken(userId, applicationName)` directly without passing
- * credentials at the call site.
+ * `ctx.obo.getOboToken({ userId, applicationName })` directly without passing
+ * credentials at the call site. `applicationName` is narrowed to the exact
+ * keys of the `applications` object you provide.
  *
  * @example
  * ```ts
@@ -411,8 +446,6 @@ async function _exchangeOboToken(
  *   },
  *   plugins: [
  *     oboPlugin({
- *       // defaultConfig can be omitted entirely when the social provider config
- *       // already has a specific tenantId.
  *       applications: {
  *         graph:    { scopes: ["https://graph.microsoft.com/.default"] },
  *         "my-api": { scopes: ["api://my-api/.default"] },
@@ -421,12 +454,17 @@ async function _exchangeOboToken(
  *   ],
  * });
  *
- * // On your server:
+ * // On your server — applicationName is typed as "graph" | "my-api":
  * const ctx = await auth.$context;
- * const { data, error } = await ctx.obo.exchangeToken(userId, "graph");
+ * const result = await ctx.obo.getOboToken({ userId, applicationName: "graph" });
+ * if (result.success) {
+ *   result.data.accessToken  // string | null | undefined
+ * }
  * ```
  */
-export const oboPlugin = (options: OboPluginOptions) => {
+export const oboPlugin = <TApplications extends ApplicationsConfig>(
+  options: OboPluginOptions<TApplications>,
+) => {
   return {
     id: "obo-plugin",
     options,
@@ -446,28 +484,24 @@ export const oboPlugin = (options: OboPluginOptions) => {
         context: {
           obo: {
             /**
-             * Exchange the user's stored Microsoft access token for an OBO token
-             * scoped to a named downstream application.
+             * Get an OBO token for the given user and downstream application.
              *
              * Credentials are already resolved — only `userId` and
-             * `applicationName` (a key from `options.applications`) are needed.
+             * `applicationName` (narrowed to the keys of `options.applications`)
+             * are required.
              *
-             * @param userId          Better Auth user ID to act on behalf of.
-             * @param applicationName Key from `options.applications`.
-             * @param fetchOptions    Optional `@better-fetch/fetch` overrides.
+             * Returns an `OboResult` discriminated union. Check `result.success`
+             * to narrow between the success (`result.data: Account`) and failure
+             * (`result.error: string`) branches.
              */
-            exchangeToken(
-              userId: string,
-              applicationName: string,
-              fetchOptions?: BetterFetchOption,
-            ): Promise<{ data: MicrosoftOBOToken | null; error: string | null }> {
-              return _exchangeOboToken(
+            getOboToken(
+              params: GetOboTokenParams<TApplications>,
+            ): Promise<OboResult> {
+              return _getOboToken(
                 ctx.internalAdapter,
                 credentials,
                 options,
-                userId,
-                applicationName,
-                fetchOptions,
+                params,
               );
             },
           },
@@ -482,13 +516,13 @@ export const oboPlugin = (options: OboPluginOptions) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Exchange the authenticated user's stored Microsoft access token for an OBO
- * (On-Behalf-Of) token scoped to a downstream application.
+ * Get an OBO (On-Behalf-Of) token for the given user and downstream application.
  *
  * This is the standalone form of the helper — useful when you want to pass
  * credentials explicitly or when you are not using `oboPlugin`. If you have
- * registered `oboPlugin`, prefer `(await auth.$context).obo.exchangeToken`
- * instead, which has credentials and options already bound.
+ * registered `oboPlugin`, prefer `(await auth.$context).obo.getOboToken`
+ * instead, which has credentials and options already bound and narrows
+ * `applicationName` to the exact keys of your `applications` config.
  *
  * When called standalone, `pluginOptions.defaultConfig` must contain all
  * required credential fields (`clientId`, `clientSecret`, and `authority` or
@@ -497,34 +531,29 @@ export const oboPlugin = (options: OboPluginOptions) => {
  * OBO tokens are **cached** in Better Auth's `account` table under a synthetic
  * `providerId` of `"obo-<applicationName>"`. A cached token is reused as long
  * as it expires more than 60 seconds in the future. Once expired, a fresh OBO
- * exchange is made automatically using the user's stored Microsoft access token.
+ * exchange is made automatically using the user's stored Microsoft `accessToken`.
  *
- * @param auth            The Better Auth instance (from `betterAuth(...)`).
- * @param pluginOptions   The same options object passed to `oboPlugin()`.
- * @param userId          The Better Auth user ID to exchange on behalf of.
- * @param applicationName A key from `pluginOptions.applications`.
- * @param fetchOptions    Optional `@better-fetch/fetch` options (e.g. for testing).
+ * @param auth          The Better Auth instance (from `betterAuth(...)`).
+ * @param pluginOptions The same options object passed to `oboPlugin()`.
+ * @param params        `{ userId, applicationName, fetchOptions? }`
  *
- * @returns `{ data: MicrosoftOBOToken, error: null }` on success,
- *          `{ data: null, error: string }` on failure.
+ * @returns An `OboResult` discriminated union — check `result.success` to narrow.
  */
-export async function exchangeOboToken(
+export async function getOboToken(
   auth: AuthLike,
   pluginOptions: OboPluginOptions,
-  userId: string,
-  applicationName: string,
-  fetchOptions?: BetterFetchOption,
-): Promise<{ data: MicrosoftOBOToken | null; error: string | null }> {
+  params: GetOboTokenParams,
+): Promise<OboResult> {
   let credentials: ResolvedCredentials;
   try {
     // No social provider context available here — defaultConfig must be complete.
     credentials = resolveCredentials(pluginOptions.defaultConfig, undefined);
   } catch (err) {
-    return { data: null, error: (err as Error).message };
+    return { success: false, data: null, error: (err as Error).message };
   }
   const ctx = await auth.$context;
-  return _exchangeOboToken(ctx.internalAdapter, credentials, pluginOptions, userId, applicationName, fetchOptions);
+  return _getOboToken(ctx.internalAdapter, credentials, pluginOptions, params);
 }
 
-// Re-export types so callers can type-narrow responses and annotate options
-export type { MicrosoftOBOError, MicrosoftOBOToken, OboPluginOptions };
+// Re-export so callers can annotate options
+export type { OboPluginOptions };

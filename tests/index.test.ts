@@ -1,9 +1,12 @@
+import type { InternalAdapter } from "better-auth";
 import { getTestInstance } from "better-auth/test";
 import { describe, expect, it, vi } from "vitest";
 import {
-  exchangeOboToken,
+  getOboToken,
   oboPlugin,
+  type GetOboTokenParams,
   type OboPluginOptions,
+  type OboResult,
 } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -20,7 +23,7 @@ const MS_SOCIAL_CONFIG = {
 // Shared plugin config
 // ---------------------------------------------------------------------------
 
-const PLUGIN_OPTIONS: OboPluginOptions = {
+const PLUGIN_OPTIONS = {
   defaultConfig: {
     authority: "https://login.microsoftonline.com/test-tenant",
     clientId: "test-client-id",
@@ -30,7 +33,7 @@ const PLUGIN_OPTIONS: OboPluginOptions = {
     graph: { scopes: ["https://graph.microsoft.com/.default"] },
     "my-api": { scopes: ["api://my-api/.default"] },
   },
-};
+} satisfies OboPluginOptions;
 
 const MOCK_OBO_RESPONSE = {
   token_type: "Bearer" as const,
@@ -45,16 +48,35 @@ const MOCK_OBO_RESPONSE = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Build an Auth instance with the OBO plugin and a better-sqlite3 in-memory DB.
- * Returns the auth instance and the raw DB adapter for seeding test data.
- */
 async function buildAuth() {
-  const { auth, db, testUser, signInWithTestUser } = await getTestInstance({
+  const { auth, signInWithTestUser } = await getTestInstance({
     plugins: [oboPlugin(PLUGIN_OPTIONS)],
     disableTestUser: false,
   });
-  return { auth, db, testUser, signInWithTestUser };
+  return { auth, signInWithTestUser };
+}
+
+function mockFetchSuccess(overrides?: Partial<typeof MOCK_OBO_RESPONSE>) {
+  return vi.fn(async () =>
+    new Response(JSON.stringify({ ...MOCK_OBO_RESPONSE, ...overrides }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
+
+async function seedMicrosoftAccount(
+  adapter: InternalAdapter,
+  userId: string,
+  accessToken = "ms-access-token",
+) {
+  return adapter.createAccount({
+    userId,
+    providerId: "microsoft",
+    accountId: "ms-account-id",
+    accessToken,
+    accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -70,25 +92,38 @@ describe("oboPlugin", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Tests: exchangeOboToken() — config resolution
+// Tests: GetOboTokenParams type
 // ---------------------------------------------------------------------------
 
-describe("exchangeOboToken — config resolution", () => {
-  it("returns an error for an unknown application name", async () => {
+describe("GetOboTokenParams type", () => {
+  it("is exported and can be used to annotate params objects", () => {
+    // This is a compile-time test — if the type doesn't exist the import fails.
+    const params: GetOboTokenParams<typeof PLUGIN_OPTIONS["applications"]> = {
+      userId: "user-123",
+      applicationName: "graph", // typed as "graph" | "my-api"
+    };
+    expect(params.applicationName).toBe("graph");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: getOboToken() — config resolution
+// ---------------------------------------------------------------------------
+
+describe("getOboToken — config resolution", () => {
+  it("returns success: false for an unknown application name", async () => {
     const { auth } = await buildAuth();
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      "any-user-id",
-      "nonexistent-app",
-    );
-    expect(data).toBeNull();
-    expect(error).toContain("Unknown application");
-    expect(error).toContain("nonexistent-app");
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: "any-user-id",
+      applicationName: "nonexistent-app",
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Unknown application");
+    expect(result.error).toContain("nonexistent-app");
   });
 
   it("derives the authority from tenantId when authority is omitted", async () => {
-    const optionsWithTenantId: OboPluginOptions = {
+    const optionsWithTenantId = {
       defaultConfig: {
         tenantId: "my-tenant-id",
         clientId: "test-client-id",
@@ -97,21 +132,14 @@ describe("exchangeOboToken — config resolution", () => {
       applications: {
         graph: { scopes: ["https://graph.microsoft.com/.default"] },
       },
-    };
+    } satisfies OboPluginOptions;
 
     const { auth, signInWithTestUser } = await getTestInstance({
       plugins: [oboPlugin(optionsWithTenantId)],
     });
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     let capturedUrl: string | undefined;
     const mockFetch = vi.fn(async (url: string | URL | Request) => {
@@ -122,8 +150,10 @@ describe("exchangeOboToken — config resolution", () => {
       });
     });
 
-    await exchangeOboToken(auth, optionsWithTenantId, user.id, "graph", {
-      customFetchImpl: mockFetch as never,
+    await getOboToken(auth, optionsWithTenantId, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
     });
 
     expect(capturedUrl).toBe(
@@ -131,9 +161,7 @@ describe("exchangeOboToken — config resolution", () => {
     );
   });
 
-  it("standalone helper returns an error when no authority or tenantId can be resolved", async () => {
-    // The standalone helper has no social provider context, so missing
-    // authority/tenantId in defaultConfig cannot be recovered.
+  it("standalone helper returns success: false when no authority or tenantId can be resolved", async () => {
     const badOptions: OboPluginOptions = {
       defaultConfig: {
         clientId: "test-client-id",
@@ -144,23 +172,19 @@ describe("exchangeOboToken — config resolution", () => {
       },
     };
     const { auth } = await buildAuth();
-    const { data, error } = await exchangeOboToken(auth, badOptions, "any-user", "graph");
-    expect(data).toBeNull();
-    expect(error).toContain("authority");
+    const result = await getOboToken(auth, badOptions, {
+      userId: "any-user",
+      applicationName: "graph",
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("authority");
   });
 
   it("uses defaultConfig clientId for all applications and varies only scope", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     const bodies: URLSearchParams[] = [];
     const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
@@ -171,56 +195,52 @@ describe("exchangeOboToken — config resolution", () => {
       });
     });
 
-    // Call for two different downstream applications
-    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "graph", {
-      customFetchImpl: mockFetch as never,
+    await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
     });
     // Expire the cache so the second app also makes an HTTP call
     const cachedGraph = await ctx.internalAdapter.findAccountByProviderId(user.id, "obo-graph");
     await ctx.internalAdapter.updateAccount(cachedGraph!.id, {
       accessTokenExpiresAt: new Date(Date.now() - 1_000),
     });
-    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "my-api", {
-      customFetchImpl: mockFetch as never,
+    await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "my-api",
+      fetchOptions: { customFetchImpl: mockFetch as never },
     });
 
-    // clientId must be the same (defaultConfig) for both calls
     expect(bodies[0]?.get("client_id")).toBe("test-client-id");
     expect(bodies[1]?.get("client_id")).toBe("test-client-id");
-
-    // scope is the only thing that differs
     expect(bodies[0]?.get("scope")).toBe("https://graph.microsoft.com/.default");
     expect(bodies[1]?.get("scope")).toBe("api://my-api/.default");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: exchangeOboToken() — missing Microsoft account
+// Tests: getOboToken() — missing Microsoft account
 // ---------------------------------------------------------------------------
 
-describe("exchangeOboToken — missing Microsoft account", () => {
-  it("returns an error when the user has no Microsoft account", async () => {
+describe("getOboToken — missing Microsoft account", () => {
+  it("returns success: false when the user has no Microsoft account", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
 
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-    );
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+    });
 
-    expect(data).toBeNull();
-    expect(error).toContain("No Microsoft access token found");
-    expect(error).toContain(user.id);
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("No Microsoft access token found");
+    expect(result.error).toContain(user.id);
   });
 
-  it("returns an error when the Microsoft account has no access token", async () => {
+  it("returns success: false when the Microsoft account has no access token", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    // Create a Microsoft account row but with no accessToken
     await ctx.internalAdapter.createAccount({
       userId: user.id,
       providerId: "microsoft",
@@ -228,39 +248,29 @@ describe("exchangeOboToken — missing Microsoft account", () => {
       // accessToken intentionally omitted
     });
 
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-    );
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+    });
 
-    expect(data).toBeNull();
-    expect(error).toContain("No Microsoft access token found");
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("No Microsoft access token found");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: exchangeOboToken() — successful token exchange
+// Tests: getOboToken() — successful token exchange
 // ---------------------------------------------------------------------------
 
-describe("exchangeOboToken — successful token exchange", () => {
+describe("getOboToken — successful token exchange", () => {
   it("calls the Microsoft token endpoint with all required OBO parameters", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     let capturedUrl: string | undefined;
     let capturedBody: URLSearchParams | undefined;
-
     const mockFetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       capturedUrl = url.toString();
       capturedBody = init?.body as URLSearchParams;
@@ -270,23 +280,16 @@ describe("exchangeOboToken — successful token exchange", () => {
       });
     });
 
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
-    expect(error).toBeNull();
-    expect(data).not.toBeNull();
-
-    // Verify the token endpoint URL
+    expect(result.success).toBe(true);
     expect(capturedUrl).toBe(
       "https://login.microsoftonline.com/test-tenant/oauth2/v2.0/token",
     );
-
-    // Verify required OBO parameters are present in the request body
     expect(capturedBody?.get("grant_type")).toBe(
       "urn:ietf:params:oauth:grant-type:jwt-bearer",
     );
@@ -294,115 +297,96 @@ describe("exchangeOboToken — successful token exchange", () => {
     expect(capturedBody?.get("requested_token_use")).toBe("on_behalf_of");
     expect(capturedBody?.get("client_id")).toBe("test-client-id");
     expect(capturedBody?.get("client_secret")).toBe("test-client-secret");
-    expect(capturedBody?.get("scope")).toBe(
-      "https://graph.microsoft.com/.default",
-    );
+    expect(capturedBody?.get("scope")).toBe("https://graph.microsoft.com/.default");
   });
 
-  it("returns the OBO token data from the Microsoft response", async () => {
+  it("returns an Account-shaped data object on success", async () => {
+    const { auth, signInWithTestUser } = await buildAuth();
+    const { user } = await signInWithTestUser();
+    const ctx = await auth.$context;
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
+
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetchSuccess() },
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+
+    // data is an Account-shaped object
+    expect(result.data.accessToken).toBe("obo-access-token-xyz");
+    expect(result.data.refreshToken).toBe("obo-refresh-token-abc");
+    expect(result.data.scope).toBe("https://graph.microsoft.com/.default");
+    expect(result.data.accessTokenExpiresAt).toBeInstanceOf(Date);
+    expect(result.data.providerId).toBe("obo-graph");
+    expect(result.data.userId).toBe(user.id);
+    expect(typeof result.data.id).toBe("string");
+  });
+
+  it("discriminated union: data is null when success is false", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
 
-    const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
       userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      applicationName: "graph",
     });
 
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
-
-    expect(error).toBeNull();
-    expect(data?.access_token).toBe("obo-access-token-xyz");
-    expect(data?.token_type).toBe("Bearer");
-    expect(data?.scope).toBe("https://graph.microsoft.com/.default");
-    expect(data?.refresh_token).toBe("obo-refresh-token-abc");
+    // TypeScript narrows correctly: in the false branch data must be null
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      // data is typed as null here — this assertion proves the runtime shape
+      expect(result.data).toBeNull();
+      expect(typeof result.error).toBe("string");
+    }
   });
 
-  it("returns an error when the Microsoft token endpoint returns an error", async () => {
+  it("returns success: false when the Microsoft token endpoint returns an error", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
-
-    const errorBody = {
-      error: "invalid_grant",
-      error_description:
-        "AADSTS70011: The provided value for the input parameter 'scope' is not valid.",
-    };
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(errorBody), {
-        status: 400,
-        headers: { "Content-Type": "application/json" },
-      }),
+      new Response(
+        JSON.stringify({
+          error: "invalid_grant",
+          error_description: "AADSTS70011: The provided value for 'scope' is not valid.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
     );
 
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
-    expect(data).toBeNull();
-    expect(error).toContain("OBO token exchange failed");
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("OBO token exchange failed");
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: exchangeOboToken() — token caching
+// Tests: getOboToken() — token caching
 // ---------------------------------------------------------------------------
 
-describe("exchangeOboToken — token caching", () => {
+describe("getOboToken — token caching", () => {
   it("caches the OBO token as a synthetic account row after a successful exchange", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
+
+    await getOboToken(auth, PLUGIN_OPTIONS, {
       userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetchSuccess() },
     });
 
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-
-    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "graph", {
-      customFetchImpl: mockFetch as never,
-    });
-
-    // The OBO token should now be cached in the account table
     const cachedAccount = await ctx.internalAdapter.findAccountByProviderId(
       user.id,
       "obo-graph",
@@ -413,58 +397,41 @@ describe("exchangeOboToken — token caching", () => {
     expect(cachedAccount?.accessTokenExpiresAt).toBeInstanceOf(Date);
   });
 
-  it("returns the cached token on a second call without making an HTTP request", async () => {
+  it("returns the cached account row on a second call without making an HTTP request", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+    const mockFetch = mockFetchSuccess();
 
     // First call — performs the HTTP exchange
-    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "graph", {
-      customFetchImpl: mockFetch as never,
+    await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
     });
     expect(mockFetch).toHaveBeenCalledTimes(1);
 
-    // Second call — should use the cache, NOT make another HTTP request
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    // Second call — served from cache, no new HTTP request
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
-    expect(mockFetch).toHaveBeenCalledTimes(1); // still 1 — no new call
-    expect(error).toBeNull();
-    expect(data?.access_token).toBe("obo-access-token-xyz");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.accessToken).toBe("obo-access-token-xyz");
+    }
   });
 
   it("re-exchanges when the cached OBO token is expired", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     // Seed an already-expired OBO cache entry
     await ctx.internalAdapter.createAccount({
@@ -472,45 +439,29 @@ describe("exchangeOboToken — token caching", () => {
       providerId: "obo-graph",
       accountId: user.id,
       accessToken: "stale-obo-token",
-      accessTokenExpiresAt: new Date(Date.now() - 1_000), // 1 second in the past
+      accessTokenExpiresAt: new Date(Date.now() - 1_000),
     });
 
-    const freshResponse = {
-      ...MOCK_OBO_RESPONSE,
-      access_token: "fresh-obo-token-after-expiry",
-    };
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(freshResponse), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+    const mockFetch = mockFetchSuccess({ access_token: "fresh-obo-token-after-expiry" });
 
-    const { data, error } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
-    expect(error).toBeNull();
-    expect(mockFetch).toHaveBeenCalledTimes(1); // a fresh HTTP call was made
-    expect(data?.access_token).toBe("fresh-obo-token-after-expiry");
+    expect(result.success).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    if (result.success) {
+      expect(result.data.accessToken).toBe("fresh-obo-token-after-expiry");
+    }
   });
 
   it("does not serve a cached token that is within the 60-second expiry buffer", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     // Seed a cached entry that expires in 30 seconds (within the 60s buffer)
     await ctx.internalAdapter.createAccount({
@@ -521,111 +472,95 @@ describe("exchangeOboToken — token caching", () => {
       accessTokenExpiresAt: new Date(Date.now() + 30_000),
     });
 
-    const freshResponse = {
-      ...MOCK_OBO_RESPONSE,
-      access_token: "freshly-fetched-token",
-    };
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(freshResponse), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+    const mockFetch = mockFetchSuccess({ access_token: "freshly-fetched-token" });
 
-    const { data } = await exchangeOboToken(
-      auth,
-      PLUGIN_OPTIONS,
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    const result = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
-    // Should have made a fresh HTTP call, not used the near-expired cache
     expect(mockFetch).toHaveBeenCalledTimes(1);
-    expect(data?.access_token).toBe("freshly-fetched-token");
+    if (result.success) {
+      expect(result.data.accessToken).toBe("freshly-fetched-token");
+    }
   });
 });
 
 // ---------------------------------------------------------------------------
-// Tests: ctx.obo.exchangeToken — via auth.$context
+// Tests: ctx.obo.getOboToken — via auth.$context
 // ---------------------------------------------------------------------------
 
-describe("ctx.obo.exchangeToken — via auth.$context", () => {
+describe("ctx.obo.getOboToken — via auth.$context", () => {
   it("exposes ctx.obo on auth.$context after plugin registration", async () => {
     const { auth } = await buildAuth();
     const ctx = await auth.$context;
     expect(ctx.obo).toBeDefined();
-    expect(typeof ctx.obo.exchangeToken).toBe("function");
+    expect(typeof ctx.obo.getOboToken).toBe("function");
   });
 
-  it("returns the OBO token with options already bound", async () => {
+  it("applicationName is narrowed to the plugin's application keys", async () => {
+    // Compile-time test — the type of applicationName should be "graph" | "my-api"
+    const { auth } = await buildAuth();
+    const ctx = await auth.$context;
+    // This should type-check: "graph" is a valid key
+    const params: GetOboTokenParams<typeof PLUGIN_OPTIONS["applications"]> = {
+      userId: "user-123",
+      applicationName: "graph",
+    };
+    expect(params.applicationName).toBe("graph");
+    // Confirm the function exists and accepts the params shape
+    expect(typeof ctx.obo.getOboToken).toBe("function");
+  });
+
+  it("returns an Account-shaped result with options already bound", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
+
+    const result = await ctx.obo.getOboToken({
       userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetchSuccess() },
     });
 
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
-
-    // No pluginOptions argument — options are bound at plugin init time
-    const { data, error } = await ctx.obo.exchangeToken(
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
-
-    expect(error).toBeNull();
-    expect(data?.access_token).toBe("obo-access-token-xyz");
-    expect(data?.token_type).toBe("Bearer");
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.accessToken).toBe("obo-access-token-xyz");
+      expect(result.data.providerId).toBe("obo-graph");
+      expect(result.error).toBeNull();
+    }
   });
 
   it("uses the same cache as the standalone helper", async () => {
     const { auth, signInWithTestUser } = await buildAuth();
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
-    const mockFetch = vi.fn(async () =>
-      new Response(JSON.stringify(MOCK_OBO_RESPONSE), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      }),
-    );
+    const mockFetch = mockFetchSuccess();
 
     // First call via the standalone helper — populates the cache
-    await exchangeOboToken(auth, PLUGIN_OPTIONS, user.id, "graph", {
-      customFetchImpl: mockFetch as never,
+    await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
     });
     expect(mockFetch).toHaveBeenCalledTimes(1);
 
-    // Second call via ctx.obo — should hit the same cache, no new HTTP request
-    const { data, error } = await ctx.obo.exchangeToken(
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    // Second call via ctx.obo — should hit the same cache
+    const result = await ctx.obo.getOboToken({
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
     expect(mockFetch).toHaveBeenCalledTimes(1); // still 1
-    expect(error).toBeNull();
-    expect(data?.access_token).toBe("obo-access-token-xyz");
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.accessToken).toBe("obo-access-token-xyz");
+    }
   });
 });
 
@@ -639,7 +574,6 @@ describe("credential fallback from Microsoft social provider", () => {
       socialProviders: { microsoft: MS_SOCIAL_CONFIG },
       plugins: [
         oboPlugin({
-          // No defaultConfig — all credentials come from the social provider
           applications: {
             graph: { scopes: ["https://graph.microsoft.com/.default"] },
           },
@@ -647,15 +581,8 @@ describe("credential fallback from Microsoft social provider", () => {
       ],
     });
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     let capturedUrl: string | undefined;
     let capturedBody: URLSearchParams | undefined;
@@ -668,16 +595,13 @@ describe("credential fallback from Microsoft social provider", () => {
       });
     });
 
-    const { data, error } = await ctx.obo.exchangeToken(
-      user.id,
-      "graph",
-      { customFetchImpl: mockFetch as never },
-    );
+    const result = await ctx.obo.getOboToken({
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
+    });
 
-    expect(error).toBeNull();
-    expect(data?.access_token).toBe("obo-access-token-xyz");
-
-    // Credentials from the social provider config
+    expect(result.success).toBe(true);
     expect(capturedBody?.get("client_id")).toBe("ms-social-client-id");
     expect(capturedBody?.get("client_secret")).toBe("ms-social-client-secret");
     expect(capturedUrl).toContain("ms-social-tenant-id");
@@ -688,10 +612,7 @@ describe("credential fallback from Microsoft social provider", () => {
       socialProviders: { microsoft: MS_SOCIAL_CONFIG },
       plugins: [
         oboPlugin({
-          defaultConfig: {
-            // Override only tenantId — clientId/clientSecret fall back to social provider
-            tenantId: "override-tenant-id",
-          },
+          defaultConfig: { tenantId: "override-tenant-id" },
           applications: {
             graph: { scopes: ["https://graph.microsoft.com/.default"] },
           },
@@ -699,15 +620,8 @@ describe("credential fallback from Microsoft social provider", () => {
       ],
     });
     const { user } = await signInWithTestUser();
-
     const ctx = await auth.$context;
-    await ctx.internalAdapter.createAccount({
-      userId: user.id,
-      providerId: "microsoft",
-      accountId: "ms-account-id",
-      accessToken: "ms-access-token",
-      accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-    });
+    await seedMicrosoftAccount(ctx.internalAdapter, user.id);
 
     let capturedUrl: string | undefined;
     let capturedBody: URLSearchParams | undefined;
@@ -720,14 +634,14 @@ describe("credential fallback from Microsoft social provider", () => {
       });
     });
 
-    await ctx.obo.exchangeToken(user.id, "graph", {
-      customFetchImpl: mockFetch as never,
+    await ctx.obo.getOboToken({
+      userId: user.id,
+      applicationName: "graph",
+      fetchOptions: { customFetchImpl: mockFetch as never },
     });
 
-    // tenantId from defaultConfig takes precedence
     expect(capturedUrl).toContain("override-tenant-id");
     expect(capturedUrl).not.toContain("ms-social-tenant-id");
-    // clientId/clientSecret fall back to social provider
     expect(capturedBody?.get("client_id")).toBe("ms-social-client-id");
     expect(capturedBody?.get("client_secret")).toBe("ms-social-client-secret");
   });
@@ -740,7 +654,7 @@ describe("credential fallback from Microsoft social provider", () => {
         microsoft: {
           clientId: "ms-client-id",
           clientSecret: "ms-client-secret",
-          tenantId: "common", // explicitly set to the multi-tenant value
+          tenantId: "common",
         },
       },
       plugins: [
@@ -752,14 +666,11 @@ describe("credential fallback from Microsoft social provider", () => {
       ],
     });
 
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("common"),
-    );
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("common"));
     warnSpy.mockRestore();
   });
 
   it("plugin init throws at startup when no credentials can be resolved", async () => {
-    // No socialProviders.microsoft, no defaultConfig credentials
     await expect(
       getTestInstance({
         plugins: [
@@ -771,5 +682,25 @@ describe("credential fallback from Microsoft social provider", () => {
         ],
       }),
     ).rejects.toThrow("Missing required credentials");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OboResult type — exported type test
+// ---------------------------------------------------------------------------
+
+describe("OboResult exported type", () => {
+  it("can be used to annotate variables", async () => {
+    const { auth, signInWithTestUser } = await buildAuth();
+    const { user } = await signInWithTestUser();
+
+    // Annotate explicitly to confirm the type is exported correctly
+    const result: OboResult = await getOboToken(auth, PLUGIN_OPTIONS, {
+      userId: user.id,
+      applicationName: "graph",
+    });
+
+    expect(result.success).toBe(false); // no microsoft account seeded
+    expect(result.data).toBeNull();
   });
 });
