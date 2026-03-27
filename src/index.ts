@@ -148,7 +148,7 @@ export const oboPlugin = (options: OboPluginOptions) => {
         async (ctx) => {
           const {
             body: { applicationName, userId },
-            context: { socialProviders, internalAdapter, adapter },
+            context: { socialProviders, internalAdapter, adapter, generateId },
           } = ctx;
 
           // Validate the application name against plugin config before
@@ -280,8 +280,11 @@ export const oboPlugin = (options: OboPluginOptions) => {
             });
           }
 
+          const accountId =
+            generateId({ model: "account" }) || crypto.randomUUID();
+
           return await internalAdapter.createAccount({
-            accountId: crypto.randomUUID(),
+            accountId,
             providerId: applicationProviderId,
             userId,
             accessToken: tokenResp.access_token,
