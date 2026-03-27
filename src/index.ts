@@ -4,11 +4,16 @@ import { APIError, defineErrorCodes } from "better-auth";
 import { createAuthEndpoint, getAccessToken } from "better-auth/api";
 import { z } from "zod";
 
+// Server-only endpoint body — userId and applicationName are the only inputs
+// needed; the plugin resolves all credentials from the auth config internally.
 const bodySchema = z.object({
   userId: z.string(),
   applicationName: z.string(),
 });
 
+// Fields read from socialProviders.microsoft.options to construct the OBO
+// request. scope is optional because the per-application scope (from
+// OboPluginOptions) is used for the exchange, not the provider's login scope.
 const msSocialProviderConfigSchema = z.object({
   clientId: z.string(),
   clientSecret: z.string(),
@@ -16,6 +21,7 @@ const msSocialProviderConfigSchema = z.object({
   scope: z.string().array().optional(),
 });
 
+// Shape of a successful Entra ID OBO token response.
 const outputSchema = z.object({
   token_type: z.literal("Bearer"),
   scope: z.string(),
@@ -24,6 +30,8 @@ const outputSchema = z.object({
   access_token: z.string(),
 });
 
+// Shape of an Entra ID error response — used by @better-fetch/fetch to
+// deserialise errors so we can extract error_description for logging.
 const defaultErrorSchema = z.object({
   error: z.string(),
   error_description: z.string().optional(),
@@ -33,6 +41,9 @@ const defaultErrorSchema = z.object({
   correlation_id: z.string().optional(),
 });
 
+// Documents the fields sent to the Entra ID token endpoint. grant_type and
+// requested_token_use are fixed values required by the OBO protocol spec
+// (RFC 7523 / Entra ID OBO extension) — they are always these exact strings.
 const inputSchema = z.object({
   client_id: z.string(),
   client_secret: z.string(),
@@ -44,6 +55,23 @@ const inputSchema = z.object({
   scope: z.string(),
 });
 
+/**
+ * Machine-readable error codes for the OBO plugin.
+ *
+ * Registered on `auth.$ERROR_CODES` and exported so callers can do
+ * programmatic error handling without matching on raw strings:
+ *
+ * ```ts
+ * import { isAPIError } from "better-auth/api";
+ * import { OBO_ERROR_CODES } from "better-auth-obo";
+ *
+ * catch (e) {
+ *   if (isAPIError(e) && e.body.code === OBO_ERROR_CODES.OBO_EXCHANGE_FAILED.code) {
+ *     // handle Entra ID rejection
+ *   }
+ * }
+ * ```
+ */
 export const OBO_ERROR_CODES = defineErrorCodes({
   UNKNOWN_APPLICATION:
     "The requested application is not configured in oboPlugin",
@@ -55,7 +83,21 @@ export const OBO_ERROR_CODES = defineErrorCodes({
     "Required OBO credentials could not be resolved — provide them in oboPlugin({ defaultConfig }) or configure the Microsoft social provider",
 });
 
+/**
+ * Configuration options for {@link oboPlugin}.
+ */
 export type OboPluginOptions = {
+  /**
+   * Named downstream applications that OBO tokens can be obtained for.
+   *
+   * Each key is an arbitrary name you choose (e.g. `"graph"`, `"my-api"`).
+   * It becomes the `applicationName` value accepted by `getOboToken` and
+   * the suffix of the synthetic `providerId` used to cache the token
+   * (`"microsoft:<applicationName>"`).
+   *
+   * `scope` is the list of OAuth 2.0 scopes to request from Entra ID for
+   * that downstream application — typically `["api://<app-id>/.default"]`.
+   */
   applications: {
     [applicationName: string]: {
       scope: string[];
@@ -63,9 +105,22 @@ export type OboPluginOptions = {
   };
 };
 
+/**
+ * Better Auth plugin that adds Microsoft Entra ID On-Behalf-Of (OBO) token
+ * exchange to your server.
+ *
+ * Requires the built-in Microsoft social provider to be configured on the
+ * same Better Auth instance — `clientId`, `clientSecret`, and `tenantId` are
+ * read from that provider's options.
+ *
+ * Exposes a single server-only endpoint: `auth.api.getOboToken`.
+ */
 export const oboPlugin = (options: OboPluginOptions) => {
   const PROVIDER_ID = "microsoft";
 
+  // Typed fetch instance for the Entra ID token endpoint. The schema
+  // validates both the request body shape and the response, and the
+  // defaultError schema deserialises Entra ID error responses.
   const $fetch = createFetch({
     defaultError: defaultErrorSchema,
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -83,6 +138,8 @@ export const oboPlugin = (options: OboPluginOptions) => {
     options,
 
     endpoints: {
+      // Pathless endpoint — intentionally not registered on the HTTP router.
+      // Call it server-side only via auth.api.getOboToken({ body: { ... } }).
       getOboToken: createAuthEndpoint(
         {
           method: "POST",
@@ -94,7 +151,8 @@ export const oboPlugin = (options: OboPluginOptions) => {
             context: { socialProviders, internalAdapter, adapter },
           } = ctx;
 
-          // Validate the application is configured before doing any DB work.
+          // Validate the application name against plugin config before
+          // touching the database — fail fast on misconfiguration.
           const appConfig = options.applications[applicationName];
           if (!appConfig) {
             throw APIError.from("BAD_REQUEST", {
@@ -103,6 +161,8 @@ export const oboPlugin = (options: OboPluginOptions) => {
             });
           }
 
+          // scope is the space-separated string sent to Entra ID. Validate it
+          // before any network or DB work.
           const scope = appConfig.scope.join(" ");
           if (!scope) {
             throw APIError.from("BAD_REQUEST", {
@@ -111,6 +171,10 @@ export const oboPlugin = (options: OboPluginOptions) => {
             });
           }
 
+          // OBO tokens are cached as synthetic Better Auth account rows using
+          // a providerId of "microsoft:<applicationName>". This keeps each
+          // downstream application's token isolated per user, with no extra
+          // database tables required.
           const applicationProviderId = `${PROVIDER_ID}:${applicationName}`;
           const applicationAccount = await adapter.findOne<Account>({
             model: "account",
@@ -129,8 +193,11 @@ export const oboPlugin = (options: OboPluginOptions) => {
             ],
           });
 
+          // Serve from cache if the token has more than 60 seconds of
+          // remaining lifetime. The 60-second buffer ensures the token won't
+          // expire mid-request in a downstream API call.
           const now = Date.now();
-          const bufferMs = 60_000; // 60-second expiry buffer
+          const bufferMs = 60_000;
           if (
             applicationAccount?.accessToken &&
             applicationAccount.accessTokenExpiresAt &&
@@ -139,6 +206,8 @@ export const oboPlugin = (options: OboPluginOptions) => {
             return applicationAccount;
           }
 
+          // Resolve the Microsoft social provider config. This is done after
+          // the cache check so we don't pay the lookup cost on cache hits.
           const msProvider = socialProviders.find(
             ({ id }) => id === PROVIDER_ID,
           );
@@ -158,6 +227,11 @@ export const oboPlugin = (options: OboPluginOptions) => {
             });
           }
 
+          // Retrieve (and if necessary refresh) the user's Microsoft access
+          // token via Better Auth's built-in getAccessToken endpoint. We call
+          // it as a function by spreading ctx and overriding method + body —
+          // the standard pattern for invoking one pathless endpoint from
+          // inside another.
           const microsoftAccess = await getAccessToken({
             ...ctx,
             method: "POST",
@@ -166,6 +240,9 @@ export const oboPlugin = (options: OboPluginOptions) => {
             returnStatus: false,
           });
 
+          // POST to the Entra ID OBO token endpoint. The user's access token
+          // becomes the assertion; Entra ID returns a new token scoped to the
+          // downstream application.
           const tenantId = msConfig.tenantId;
           const { data: tokenResp, error: tokenError } = await $fetch(
             "@post/token",
@@ -192,6 +269,9 @@ export const oboPlugin = (options: OboPluginOptions) => {
             Date.now() + tokenResp.expires_in * 1000,
           );
 
+          // Update the existing cache row if one exists, otherwise create a
+          // new one. accountId on a new row is a random UUID — it is a
+          // plugin-managed pseudo-account with no real OAuth provider identity.
           if (applicationAccount) {
             return await internalAdapter.updateAccount(applicationAccount.id, {
               accessToken: tokenResp.access_token,

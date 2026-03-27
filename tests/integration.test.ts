@@ -1,187 +1,190 @@
-/**
- * Integration tests for the OBO plugin against real Microsoft Entra ID endpoints.
- *
- * Run with:
- *   pnpm test:integration
- *
- * Requires a `.env.test` file with:
- *   VITE_ENTRA_CLIENT_ID      – middle-tier app client ID
- *   VITE_ENTRA_CLIENT_SECRET  – middle-tier app client secret
- *   VITE_ENTRA_TENANT_ID      – Azure AD tenant ID (must be specific, not "common")
- *   VITE_ENTRA_OBO_SCOPE      – comma-separated downstream scope
- *   VITE_ENTRA_ACCESS_TOKEN   – a valid delegated access token issued to VITE_ENTRA_CLIENT_ID
- *
- * All tests are skipped when any of the above variables are absent so that CI
- * without secrets does not fail.
- */
-
-import { isAPIError } from "better-auth/api";
 import { getTestInstance } from "better-auth/test";
-import { describe, expect, it } from "vitest";
-import { OBO_ERROR_CODES, oboPlugin } from "../src/index.js";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { OBO_ERROR_CODES, oboPlugin } from "../src/index";
 
 // ---------------------------------------------------------------------------
-// Guard — skip everything when credentials are not available
+// Environment variables (loaded via --env-file=.env.test)
 // ---------------------------------------------------------------------------
 
-const hasCredentials =
-  !!process.env.VITE_ENTRA_CLIENT_ID &&
-  !!process.env.VITE_ENTRA_CLIENT_SECRET &&
-  !!process.env.VITE_ENTRA_TENANT_ID &&
-  !!(process.env.VITE_ENTRA_OBO_SCOPE ?? process.env.VITE_ENTRA_OBO_SCOPES) &&
-  !!process.env.VITE_ENTRA_ACCESS_TOKEN;
-
-const oboScope = (process.env.VITE_ENTRA_OBO_SCOPE ?? process.env.VITE_ENTRA_OBO_SCOPES ?? "")
-  .split(",")
-  .filter(Boolean);
+const ACCESS_TOKEN = process.env.VITE_ENTRA_ACCESS_TOKEN ?? "";
+const CLIENT_ID = process.env.VITE_ENTRA_CLIENT_ID ?? "";
+const CLIENT_SECRET = process.env.VITE_ENTRA_CLIENT_SECRET ?? "";
+const TENANT_ID = process.env.VITE_ENTRA_TENANT_ID ?? "";
+const OBO_SCOPE = process.env.VITE_ENTRA_OBO_SCOPE ?? "";
 
 // ---------------------------------------------------------------------------
-// Shared auth instance
+// Token expiry guard — decode the JWT payload without verifying the signature
 // ---------------------------------------------------------------------------
 
-async function buildIntegrationAuth() {
-  const { auth, signInWithTestUser } = await getTestInstance({
-    socialProviders: {
-      microsoft: {
-        clientId: process.env.VITE_ENTRA_CLIENT_ID!,
-        clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
-        tenantId: process.env.VITE_ENTRA_TENANT_ID!,
-      },
-    },
-    plugins: [
-      oboPlugin({
-        applications: { downstream: { scope: oboScope } },
-      }),
-    ],
-  });
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  try {
+    return JSON.parse(
+      Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"),
+    );
+  } catch {
+    return {};
+  }
+}
 
-  const { user } = await signInWithTestUser();
-  const ctx = await auth.$context;
+const jwtPayload = decodeJwtPayload(ACCESS_TOKEN);
+const tokenExp = typeof jwtPayload.exp === "number" ? jwtPayload.exp : 0;
+const tokenExpired = Date.now() > tokenExp * 1000;
+const tokenExpiresAt = new Date(tokenExp * 1000);
 
-  await ctx.internalAdapter.createAccount({
-    userId: user.id,
-    providerId: "microsoft",
-    accountId: user.id,
-    accessToken: process.env.VITE_ENTRA_ACCESS_TOKEN!,
-    accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
-  });
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-  return { auth, ctx, user };
+type AuthContext = Awaited<
+  ReturnType<(typeof import("better-auth"))["betterAuth"]["prototype"]["$context"]>
+>;
+
+async function clearAccounts(ctx: AuthContext, userId: string) {
+  const accounts = await ctx.internalAdapter.findAccounts(userId);
+  for (const a of accounts) await ctx.internalAdapter.deleteAccount(a.id);
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Integration tests
+// Skip the entire suite if the access token in .env.test is expired.
+// To refresh it, sign in to the app and copy a new VITE_ENTRA_ACCESS_TOKEN.
 // ---------------------------------------------------------------------------
 
-describe("OBO integration — real Entra ID token exchange", () => {
-  it.skipIf(!hasCredentials)(
-    "auth.api.getOboToken performs a successful OBO exchange and returns an Account",
-    async () => {
-      const { auth, user } = await buildIntegrationAuth();
+describe.skipIf(tokenExpired)(
+  "oboPlugin integration (live Entra ID)",
+  () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let api: any;
+    let ctx: AuthContext;
+    let testUserId: string;
 
-      const account = await auth.api.getOboToken({
-        body: { userId: user.id, applicationName: "downstream" },
-      });
-
-      expect(typeof account.accessToken).toBe("string");
-      expect(account.accessToken!.length).toBeGreaterThan(0);
-      expect(account.providerId).toBe("obo-downstream");
-      expect(account.userId).toBe(user.id);
-      expect(account.accessTokenExpiresAt).toBeInstanceOf(Date);
-      expect(account.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
-      const returnedScope = (account.scope ?? "").split(" ");
-      const requestedScope = oboScope.flatMap((s) => s.split(" "));
-      expect(returnedScope.some((s) => requestedScope.includes(s))).toBe(true);
-    },
-    30_000,
-  );
-
-  it.skipIf(!hasCredentials)(
-    "OBO token is written to the account cache after exchange",
-    async () => {
-      const { auth, ctx, user } = await buildIntegrationAuth();
-
-      await auth.api.getOboToken({
-        body: { userId: user.id, applicationName: "downstream" },
-      });
-
-      const cached = await ctx.internalAdapter.findAccountByProviderId(
-        user.id,
-        "obo-downstream",
-      );
-
-      expect(cached).not.toBeNull();
-      expect(typeof cached?.accessToken).toBe("string");
-      expect(cached!.accessToken!.length).toBeGreaterThan(0);
-      expect(cached?.accessTokenExpiresAt).toBeInstanceOf(Date);
-      expect(cached!.accessTokenExpiresAt!.getTime()).toBeGreaterThan(Date.now());
-    },
-    30_000,
-  );
-
-  it.skipIf(!hasCredentials)(
-    "second call returns the cached Account row without a new HTTP request",
-    async () => {
-      const { auth, user } = await buildIntegrationAuth();
-
-      const first = await auth.api.getOboToken({
-        body: { userId: user.id, applicationName: "downstream" },
-      });
-
-      const second = await auth.api.getOboToken({
-        body: { userId: user.id, applicationName: "downstream" },
-      });
-
-      expect(second.id).toBe(first.id);
-      expect(second.accessToken).toBe(first.accessToken);
-    },
-    30_000,
-  );
-
-  it.skipIf(!hasCredentials)(
-    "throws APIError BAD_GATEWAY / OBO_EXCHANGE_FAILED with Entra ID error details when assertion is invalid",
-    async () => {
-      const { auth, signInWithTestUser } = await getTestInstance({
+    beforeAll(async () => {
+      const { auth } = await getTestInstance({
         socialProviders: {
           microsoft: {
-            clientId: process.env.VITE_ENTRA_CLIENT_ID!,
-            clientSecret: process.env.VITE_ENTRA_CLIENT_SECRET!,
-            tenantId: process.env.VITE_ENTRA_TENANT_ID!,
+            clientId: CLIENT_ID,
+            clientSecret: CLIENT_SECRET,
+            tenantId: TENANT_ID,
           },
         },
         plugins: [
           oboPlugin({
-            applications: { downstream: { scope: oboScope } },
+            applications: {
+              downstream: { scope: OBO_SCOPE.split(",") },
+            },
           }),
         ],
       });
-      const { user } = await signInWithTestUser();
-      const ctx = await auth.$context;
+
+      api = auth.api;
+      ctx = await auth.$context;
+
+      const user = await ctx.internalAdapter.createUser({
+        id: crypto.randomUUID(),
+        email: "integration-test@example.com",
+        name: "Integration Test User",
+        emailVerified: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      testUserId = user.id;
+
+      // Seed the user's Microsoft account using the real access token from
+      // .env.test. accessTokenExpiresAt is set from the JWT exp claim so
+      // getAccessToken won't try to refresh it (it's not expired yet).
+      await ctx.internalAdapter.createAccount({
+        accountId: testUserId,
+        providerId: "microsoft",
+        userId: testUserId,
+        accessToken: ACCESS_TOKEN,
+        accessTokenExpiresAt: tokenExpiresAt,
+        scope: "access-as",
+      });
+    });
+
+    afterEach(async () => {
+      // Remove any OBO account rows created during the test, leaving the
+      // seeded Microsoft account intact for subsequent tests.
+      const accounts = await ctx.internalAdapter.findAccounts(testUserId);
+      for (const a of accounts) {
+        if (a.providerId !== "microsoft") {
+          await ctx.internalAdapter.deleteAccount(a.id);
+        }
+      }
+    });
+
+    // -----------------------------------------------------------------------
+    // 1. Happy path — real OBO exchange succeeds
+    // -----------------------------------------------------------------------
+    it("exchanges the user access token for an OBO token via Entra ID", async () => {
+      const result = await api.getOboToken({
+        body: { userId: testUserId, applicationName: "downstream" },
+      });
+
+      expect(result).toBeTruthy();
+      expect(typeof result.accessToken).toBe("string");
+      expect(result.accessToken.length).toBeGreaterThan(0);
+      expect(result.providerId).toBe("microsoft:downstream");
+      expect(result.userId).toBe(testUserId);
+      expect(result.accessTokenExpiresAt).toBeInstanceOf(Date);
+      expect(result.accessTokenExpiresAt.getTime()).toBeGreaterThan(Date.now());
+    });
+
+    // -----------------------------------------------------------------------
+    // 2. Cached token returned on second call — no second exchange
+    // -----------------------------------------------------------------------
+    it("returns the cached OBO token on subsequent calls without a new exchange", async () => {
+      const first = await api.getOboToken({
+        body: { userId: testUserId, applicationName: "downstream" },
+      });
+
+      const second = await api.getOboToken({
+        body: { userId: testUserId, applicationName: "downstream" },
+      });
+
+      // Both calls must return the same access token — the second one was served
+      // from the cache without hitting Entra ID again.
+      expect(second.accessToken).toBe(first.accessToken);
+      expect(second.accessTokenExpiresAt.getTime()).toBe(
+        first.accessTokenExpiresAt.getTime(),
+      );
+    });
+
+    // -----------------------------------------------------------------------
+    // 3. Invalid access token → Entra rejects it → OBO_EXCHANGE_FAILED
+    // -----------------------------------------------------------------------
+    it("throws OBO_EXCHANGE_FAILED when the stored access token is invalid", async () => {
+      // Create a separate user whose Microsoft account holds a bogus token.
+      const badUser = await ctx.internalAdapter.createUser({
+        id: crypto.randomUUID(),
+        email: "bad-token@example.com",
+        name: "Bad Token User",
+        emailVerified: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
 
       await ctx.internalAdapter.createAccount({
-        userId: user.id,
+        accountId: badUser.id,
         providerId: "microsoft",
-        accountId: user.id,
+        userId: badUser.id,
         accessToken: "this-is-not-a-valid-token",
-        accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+        accessTokenExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
+        scope: "access-as",
       });
 
       try {
-        await auth.api.getOboToken({
-          body: { userId: user.id, applicationName: "downstream" },
+        await expect(
+          api.getOboToken({
+            body: { userId: badUser.id, applicationName: "downstream" },
+          }),
+        ).rejects.toMatchObject({
+          body: { code: OBO_ERROR_CODES.OBO_EXCHANGE_FAILED.code },
         });
-        expect.fail("Expected APIError to be thrown");
-      } catch (e) {
-        expect(isAPIError(e)).toBe(true);
-        if (isAPIError(e)) {
-          expect(e.status).toBe("BAD_GATEWAY");
-          expect(e.body?.code).toBe(OBO_ERROR_CODES.OBO_EXCHANGE_FAILED.code);
-          // Entra ID error fields should be present on the body
-          expect(typeof e.body?.error).toBe("string");
-          expect(typeof e.body?.error_description).toBe("string");
-        }
+      } finally {
+        await clearAccounts(ctx, badUser.id);
+        await ctx.internalAdapter.deleteUser(badUser.id);
       }
-    },
-    30_000,
-  );
-});
+    });
+  },
+);

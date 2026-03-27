@@ -63,7 +63,9 @@ export const auth = betterAuth({
 
 ## Usage
 
-The plugin exposes `auth.api.getOboToken` — the same pattern used by all major Better Auth plugins (`auth.api.banUser`, `auth.api.createOrganization`, etc.). Better Auth calls the handler directly without making an HTTP request.
+This plugin is **server-only**. The endpoint is not registered on the HTTP router and cannot be called from a browser client. Call it from your server-side code (API route handlers, background jobs, etc.) via `auth.api`.
+
+> **TypeScript note:** Because the endpoint has no URL path, it is intentionally excluded from the inferred type of `auth.api`. Cast to `any` or use a typed wrapper to call it.
 
 On failure the endpoint throws an `APIError`. Catch it with `isAPIError` from `better-auth/api` and check `e.body.code` against `OBO_ERROR_CODES` for programmatic handling.
 
@@ -72,7 +74,9 @@ import { auth } from "./auth";
 import { isAPIError } from "better-auth/api";
 
 try {
-  const account = await auth.api.getOboToken({
+  // Cast required — server-only endpoints are excluded from auth.api's
+  // inferred TypeScript type but exist at runtime.
+  const account = await (auth.api as any).getOboToken({
     body: { userId, applicationName: "graph" },
   });
 
@@ -82,11 +86,9 @@ try {
   });
 } catch (e) {
   if (isAPIError(e)) {
-    // e.status:        "NOT_FOUND" | "BAD_REQUEST" | "BAD_GATEWAY" | "INTERNAL_SERVER_ERROR"
+    // e.status:        "NOT_FOUND" | "BAD_REQUEST" | "INTERNAL_SERVER_ERROR"
     // e.body.code:     one of OBO_ERROR_CODES (e.g. "MICROSOFT_ACCOUNT_NOT_FOUND")
     // e.body.message:  human-readable description
-    // For OBO_EXCHANGE_FAILED, Entra ID error fields are also on e.body:
-    // e.body.error, e.body.error_description, e.body.error_codes, e.body.trace_id
     console.error(e.status, e.body?.code, e.body?.message);
   }
 }
@@ -100,34 +102,27 @@ try {
 
 | Option | Type | Required | Description |
 |---|---|---|---|
-| `applications` | `Record<string, { scope: string[], id?: string }>` | Yes | Named downstream applications. Each key becomes a valid `applicationName`. `scope` are the downstream API scope to request. |
-| `defaultConfig` | `OboDefaultConfig` | No | Credential overrides. Any field omitted here is read from the Microsoft social provider config. The entire object may be omitted when the social provider already has a specific `tenantId`. |
-| `defaultConfig.clientId` | `string` | No* | Middle-tier app client ID. Falls back to `socialProviders.microsoft.clientId`. |
-| `defaultConfig.clientSecret` | `string` | No* | Middle-tier app client secret. Falls back to `socialProviders.microsoft.clientSecret`. |
-| `defaultConfig.tenantId` | `string` | No* | Specific tenant ID. Used to derive the authority URL. Falls back to `socialProviders.microsoft.tenantId`. |
-| `defaultConfig.authority` | `string` | No* | Full token endpoint authority, e.g. `https://login.microsoftonline.com/my-tenant`. Takes precedence over `tenantId`. Useful for sovereign clouds (Azure Government, Azure China). |
+| `applications` | `Record<string, { scope: string[] }>` | Yes | Named downstream applications. Each key becomes a valid `applicationName`. `scope` is the list of OAuth 2.0 scopes to request from Entra ID for that application — typically `["api://<app-id>/.default"]`. |
 
-\* Required collectively — after merging `defaultConfig` with the social provider config, `clientId`, `clientSecret`, and either `authority` or `tenantId` must all be resolvable. The plugin throws at startup if any are missing.
+`clientId`, `clientSecret`, and `tenantId` are read directly from `socialProviders.microsoft` in your Better Auth config — no duplication required.
 
 ### `auth.api.getOboToken({ body: params })`
 
-`body` accepts a `GetOboTokenParams` object:
+`body` accepts the following fields:
 
 | Field | Type | Description |
 |---|---|---|
 | `userId` | `string` | The Better Auth user ID to act on behalf of. The user must have previously signed in via the Microsoft social provider. |
 | `applicationName` | `string` | A key from `options.applications`. |
-| `fetchOptions` | `BetterFetchOption` | Optional. Advanced fetch overrides (custom fetch implementation, timeouts, etc.). |
 
 **Returns:** `Promise<Account>` — the Better Auth `Account` row for the cached OBO token:
 
 | Field | Type | Description |
 |---|---|---|
 | `accessToken` | `string \| null \| undefined` | The OBO access token for the downstream API. |
-| `refreshToken` | `string \| null \| undefined` | Present when `offline_access` is in the requested scope. |
-| `scope` | `string \| null \| undefined` | Space-separated scope granted by Entra ID. |
+| `scope` | `string \| null \| undefined` | Space-separated scopes granted by Entra ID. |
 | `accessTokenExpiresAt` | `Date \| null \| undefined` | When the token expires. |
-| `providerId` | `string` | Always `"obo-<applicationName>"`. |
+| `providerId` | `string` | Always `"microsoft:<applicationName>"`. |
 | `userId` | `string` | The Better Auth user ID. |
 
 **Throws:** `APIError` on failure. Check `e.status` and `e.body.code` against `OBO_ERROR_CODES`.
@@ -205,7 +200,7 @@ VITE_ENTRA_ACCESS_TOKEN=<a-valid-delegated-access-token>
 pnpm test:integration
 ```
 
-Integration tests skip gracefully when any of the above variables are absent, so they will not cause CI pipelines to fail when secrets are not configured.
+Integration tests skip gracefully when `VITE_ENTRA_ACCESS_TOKEN` is expired, so they will not cause CI pipeline failures when the token needs refreshing. To get a new token, sign in to your app with a Microsoft account and copy the access token issued to your middle-tier app registration.
 
 ---
 
