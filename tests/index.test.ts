@@ -221,14 +221,16 @@ describe("oboPlugin", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 6. No Microsoft account for the user → getAccessToken error propagates
+  // 6. No Microsoft account for the user → MICROSOFT_ACCOUNT_NOT_FOUND
   // -------------------------------------------------------------------------
-  it("propagates an error when the user has no Microsoft account", async () => {
+  it("throws MICROSOFT_ACCOUNT_NOT_FOUND when the user has no Microsoft account", async () => {
     await clearAccounts(ctx, testUserId);
 
     await expect(
       api.getOboToken({ body: { userId: testUserId, applicationName: APP_NAME } }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({
+      body: { code: OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND.code },
+    });
 
     expect(mockOboFetch).not.toHaveBeenCalled();
   });

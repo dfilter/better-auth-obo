@@ -227,6 +227,34 @@ export const oboPlugin = (options: OboPluginOptions) => {
             });
           }
 
+          // Retrieve the user's Microsoft account row. Better Auth 1.7
+          // removed providerId as an account selector on getAccessToken —
+          // it now selects the local account row by its id (or the signed
+          // account cookie) — so the row is resolved here and its id is
+          // passed to the endpoint.
+          const microsoftAccount = await adapter.findOne<Account>({
+            model: "account",
+            where: [
+              {
+                field: "providerId",
+                value: PROVIDER_ID,
+                operator: "eq",
+                connector: "AND",
+              },
+              {
+                field: "userId",
+                value: userId,
+                operator: "eq",
+              },
+            ],
+          });
+          if (!microsoftAccount) {
+            throw APIError.from("BAD_REQUEST", {
+              code: OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND.code,
+              message: `${OBO_ERROR_CODES.MICROSOFT_ACCOUNT_NOT_FOUND.message}: ${userId}`,
+            });
+          }
+
           // Retrieve (and if necessary refresh) the user's Microsoft access
           // token via Better Auth's built-in getAccessToken endpoint. We call
           // it as a function by spreading ctx and overriding method + body —
@@ -235,7 +263,7 @@ export const oboPlugin = (options: OboPluginOptions) => {
           const microsoftAccess = await getAccessToken({
             ...ctx,
             method: "POST",
-            body: { providerId: PROVIDER_ID, userId },
+            body: { accountId: microsoftAccount.id, userId },
             returnHeaders: false,
             returnStatus: false,
           });

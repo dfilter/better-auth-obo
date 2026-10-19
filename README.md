@@ -26,6 +26,8 @@ pnpm add better-auth-obo
 
 `better-auth` and `@better-fetch/fetch` are peer dependencies — they must be present in your project. `better-auth` almost certainly already is, and `@better-fetch/fetch` is included transitively by `better-auth` itself.
 
+This plugin requires `better-auth` `^1.7.0`. It uses the 1.7 account selector on `getAccessToken` (which resolves the account by local row id rather than `providerId`), so earlier versions are not supported.
+
 ---
 
 ## Setup
@@ -135,15 +137,15 @@ Machine-readable error codes registered on `auth.$ERROR_CODES`. Each value has `
 |---|---|---|
 | `UNKNOWN_APPLICATION` | 400 | `applicationName` not found in plugin config |
 | `MISSING_APPLICATION_SCOPE` | 400 | Application config has an empty `scope` array |
-| `MICROSOFT_ACCOUNT_NOT_FOUND` | 404 | User has no Microsoft `accessToken` stored |
+| `MICROSOFT_ACCOUNT_NOT_FOUND` | 400 | User has no Microsoft account stored — they must sign in via the Microsoft social provider first |
 | `OBO_EXCHANGE_FAILED` | 502 | Entra ID rejected the OBO exchange. Entra ID's `error`, `error_description`, `error_codes`, `trace_id`, and `correlation_id` are spread onto `e.body`. |
-| `MISSING_CREDENTIALS` | 500 | Required credentials missing from both `defaultConfig` and the social provider config |
+| `MISSING_CREDENTIALS` | 500 | Credentials could not be resolved from the Microsoft social provider config (or it is absent/malformed) |
 
 ---
 
 ## Token caching
 
-OBO tokens are cached automatically in Better Auth's existing `account` table using a synthetic `providerId` of `"obo-<applicationName>"`. This avoids extra database tables and works with any Better Auth database adapter.
+OBO tokens are cached automatically in Better Auth's existing `account` table using a synthetic `providerId` of `"microsoft:<applicationName>"`. This avoids extra database tables and works with any Better Auth database adapter.
 
 **Cache behaviour:**
 
